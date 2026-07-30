@@ -7,10 +7,9 @@ on:
   push:
     branches: [main]
 
+# Least privilege by default; only the publish job widens it.
 permissions:
   contents: read
-  # npm provenance signs with a short-lived OIDC token from the runner.
-  id-token: write
 
 # Two pushes in quick succession would otherwise race two publishes.
 concurrency:
@@ -18,20 +17,17 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish:
-    # Provenance requires a cloud-hosted runner on a supported provider.
+  # Deliberately has NO `environment`, so it starts at once and its result is visible before
+  # anyone is asked to approve anything. A single job holding both the gates and the publish
+  # would gate the gates too: the approval prompt arrives before a single test has run, and
+  # the reviewer decides blind. Splitting is what makes "publish is the last step, behind
+  # the gates" actually true rather than merely intended.
+  verify:
     runs-on: ubuntu-latest
-    # A gate on a HUMAN, not on branch hygiene. This repo is public and a merged pull request
-    # is a push to main, so without this a merge is enough to reach NODE_AUTH_TOKEN — either
-    # through a package lifecycle script that `pnpm -r publish` runs, or by having `pnpm test`
-    # create a fourth package for `-r` to enumerate. Configure `npm-publish` in the repo's
-    # Settings → Environments with a required reviewer. Branch protection is NOT the control
-    # here: requiring pull requests on main would reject the release script's direct push.
-    environment: npm-publish
     steps:
       - uses: actions/checkout@v4
         with:
-          # Nothing in this job pushes; don't leave a usable credential in the checkout.
+          # Nothing here pushes; don't leave a usable credential in the checkout.
           persist-credentials: false
 
       # No `version:` input on purpose. The action reads packageManager from package.json,
@@ -44,21 +40,56 @@ jobs:
         with:
           node-version: 20
           cache: pnpm
-          registry-url: https://registry.npmjs.org
 
       - run: pnpm install --frozen-lockfile
 
-      # Before typecheck: @dropinnodex/server and @dropinnodex/react resolve @dropinnodex/client's types
-      # through its built dist/index.d.ts, which does not exist in a fresh clone. The build
-      # is topological, so client goes first on its own.
+      # Before typecheck: @dropinnodex/server and @dropinnodex/react resolve
+      # @dropinnodex/client's types through its built dist/index.d.ts, which does not exist
+      # in a fresh clone. The build is topological, so client goes first on its own.
       - run: pnpm -r build
 
       - run: pnpm typecheck
       - run: pnpm lint
       - run: pnpm test
 
+  publish:
+    # Unreachable unless every gate above passed.
+    needs: verify
+    # Provenance requires a cloud-hosted runner on a supported provider.
+    runs-on: ubuntu-latest
+    # A gate on a HUMAN, and one that now fires only after CI is green. This repo is public
+    # and a merged pull request is a push to main, so without this a merge is enough to
+    # reach NODE_AUTH_TOKEN — either through a package lifecycle script that
+    # `pnpm -r publish` runs, or by having an earlier step create a fourth package for `-r`
+    # to enumerate. Configure `npm-publish` in Settings → Environments with a required
+    # reviewer. Branch protection is NOT the control here: requiring pull requests on main
+    # would reject the release script's direct push.
+    environment: npm-publish
+    permissions:
+      contents: read
+      # npm provenance signs with a short-lived OIDC token from the runner. Scoped to this
+      # job so the verify job, which runs whatever landed on main, never holds it.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      - run: pnpm install --frozen-lockfile
+
+      # Rebuilt here because jobs do not share a filesystem — verify's dist/ is gone.
+      - run: pnpm -r build
+
       # --no-git-checks: the build above wrote dist/, so the tree is dirty and pnpm would
-      # otherwise refuse. Nothing here is published that the gates above did not pass.
+      # otherwise refuse. Nothing reaches npm that the verify job did not pass.
       - run: pnpm -r publish --provenance --access public --no-git-checks
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
