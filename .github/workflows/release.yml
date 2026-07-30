@@ -38,7 +38,11 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # 22, not 20: pnpm 11 itself requires Node >= 22.13 and dies on node:sqlite under
+          # 20 — which setup-node hits immediately, since `cache: pnpm` shells out to pnpm
+          # to locate the store. Unrelated to engines.node (">=20"), which describes what
+          # CONSUMERS of the published packages need, not what builds them.
+          node-version: 22
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile
@@ -79,7 +83,11 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # 22, not 20: pnpm 11 itself requires Node >= 22.13 and dies on node:sqlite under
+          # 20 — which setup-node hits immediately, since `cache: pnpm` shells out to pnpm
+          # to locate the store. Unrelated to engines.node (">=20"), which describes what
+          # CONSUMERS of the published packages need, not what builds them.
+          node-version: 22
           cache: pnpm
           registry-url: https://registry.npmjs.org
 
