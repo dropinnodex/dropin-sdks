@@ -1,0 +1,9 @@
+packages:
+  - 'packages/*'
+
+# esbuild → vite/vitest; unrs-resolver → typescript-eslint's module resolver.
+# The monorepo's Nest, swc, and testcontainers entries are deliberately absent: the SDKs
+# have no decorators and no Docker-backed suites.
+allowBuilds:
+  esbuild: true
+  unrs-resolver: true

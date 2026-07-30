@@ -1,0 +1,183 @@
+// This import is deliberate: it makes a browser-targeted bundle of this package fail
+// loudly rather than silently shipping your api_secret to a browser.
+import { timingSafeEqual } from 'node:crypto'
+import * as jose from 'jose'
+// Type-only: @dropinnodex/client is zero-dep and isomorphic, so importing its types here does
+// not pull anything into the runtime bundle (erased at compile time) and does not violate
+// the dependency boundary — which forbids @dropinnodex/client and @dropinnodex/react depending on
+// @dropinnodex/server, not the reverse. This is what makes `feed().get()` return a typed
+// `Page<Activity<TCustom>>` instead of `unknown`, so SSR `initialData` flows typed end to end.
+import type { Activity, FollowStats, Page, RequestOptions } from '@dropinnodex/client'
+
+export type { RequestOptions }
+
+/**
+ * A webhook destination. The delivery infrastructure owns storage and the full response
+ * shape, so the fields this SDK itself sets or reads are typed and the index signature
+ * keeps everything else reachable — rather than inventing a closed contract the SDK does
+ * not control.
+ */
+export interface WebhookDestination {
+  /** Pass this to `webhooks.remove()`. */
+  id: string
+  /** Always "webhook" for destinations created through this SDK. */
+  type?: string
+  /** `["*"]` — every event topic. */
+  topics?: string[]
+  config?: { url?: string } & Record<string, unknown>
+  /** The HMAC-SHA256 signing secret. Returned by `create`; verify deliveries with it. */
+  credentials?: Record<string, unknown>
+  created_at?: string
+  disabled_at?: string | null
+  [key: string]: unknown
+}
+
+const MAX_TTL_SECONDS = 86_400
+
+/** The hosted API. Overridden via `url` for staging, a proxy, or local development. */
+export const DEFAULT_API_URL = 'https://api.getnodex.cloud'
+
+export interface DropInServerOptions {
+  /** Your tenant id, e.g. "acme". Signed as the token's `aud` claim and verified on every request. */
+  tenantId: string
+  /** Public. Sent as X-Api-Key so the gateway can resolve the tenant. */
+  apiKey: string
+  /** Never leaves your server. */
+  apiSecret: string
+  /**
+   * Base URL of the dropin API. Defaults to `https://api.getnodex.cloud`; set it to point
+   * at staging, a proxy, or a local server — e.g. `http://localhost:3000`. No trailing slash.
+   */
+  url?: string | undefined
+}
+
+export interface TokenOptions {
+  /** e.g. "1h", "15m", "30s". Default "1h". */
+  expiresIn?: string
+}
+
+function parseDuration(spec: string): number {
+  const m = /^(\d+)([smhd])$/.exec(spec)
+  if (!m) throw new Error(`invalid expiresIn: ${spec}`)
+  const n = Number(m[1])
+  const unit = m[2] as 's' | 'm' | 'h' | 'd'
+  return n * { s: 1, m: 60, h: 3600, d: 86_400 }[unit]
+}
+
+type FetchFn = typeof fetch
+
+export class DropInServer {
+  private readonly key: Uint8Array
+
+  constructor(private readonly opts: DropInServerOptions, private readonly fetchFn?: FetchFn) {
+    if (!opts.apiSecret) throw new Error('apiSecret is required')
+    if (!opts.apiKey) throw new Error('apiKey is required')
+    if (!opts.tenantId) throw new Error('tenantId is required')
+    this.key = new TextEncoder().encode(opts.apiSecret)
+    void timingSafeEqual // keep the node:crypto import load-bearing
+  }
+
+  private async sign(claims: Record<string, unknown>, opts: TokenOptions): Promise<string> {
+    const ttl = parseDuration(opts.expiresIn ?? '1h')
+    if (ttl > MAX_TTL_SECONDS) {
+      // Fail here rather than minting a token that will be rejected on first use.
+      throw new Error(`expiresIn exceeds the 24h (86400s) ceiling: ${ttl}s`)
+    }
+    const iat = Math.floor(Date.now() / 1000)
+    return new jose.SignJWT(claims)
+      .setProtectedHeader({ alg: 'HS256' })
+      .setIssuer('dropin')
+      // The TENANT ID, not the api key — this is what the audience is verified against.
+      .setAudience(this.opts.tenantId)
+      .setIssuedAt(iat)
+      .setExpirationTime(iat + ttl)
+      .sign(this.key)
+  }
+
+  /** Local HMAC. Zero network calls — tokens are minted entirely on your server. */
+  createUserToken(userId: string, opts: TokenOptions = {}): Promise<string> {
+    return this.sign({ sub: userId, user_id: userId }, opts)
+  }
+
+  createServerToken(opts: TokenOptions = {}): Promise<string> {
+    return this.sign({}, opts)
+  }
+
+  private async call<T>(method: string, path: string, body?: unknown, opts: RequestOptions = {}): Promise<T> {
+    const { signal } = opts
+    // Bail before signing a token for a call the caller has already given up on.
+    if (signal?.aborted) throw signal.reason ?? new DOMException('The operation was aborted.', 'AbortError')
+    const token = await this.createServerToken()
+    // Fall back to the global fetch at call time (not construction) so tests that swap
+    // globalThis.fetch after building the client still take effect.
+    const doFetch = this.fetchFn ?? fetch
+    const res = await doFetch(`${this.opts.url ?? DEFAULT_API_URL}${path}`, {
+      method,
+      headers: {
+        authorization: `Bearer ${token}`,
+        'x-api-key': this.opts.apiKey,
+        ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
+      },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      // Omitted entirely when absent: some fetch polyfills choke on `signal: undefined`.
+      ...(signal !== undefined ? { signal } : {}),
+    })
+    if (!res.ok) {
+      const text = await res.text()
+      throw new Error(`dropin ${method} ${path} failed: ${res.status} ${text}`)
+    }
+    return res.status === 204 ? (undefined as T) : ((await res.json()) as T)
+  }
+
+  upsertUser(
+    user: { id: string; custom?: Record<string, unknown> },
+    opts: RequestOptions = {},
+  ): Promise<{ id: string; custom: Record<string, unknown> }> {
+    return this.call('POST', '/v1/users', { id: user.id, custom: user.custom ?? {} }, opts)
+  }
+
+  /** Invalidates all of a user's existing tokens immediately. The revocation is recorded
+   *  server-side and enforced from the next request onward, so tokens already handed to a
+   *  browser stop working without waiting for them to expire. */
+  revokeUserTokens(userId: string, opts: RequestOptions = {}): Promise<void> {
+    return this.call('POST', `/v1/users/${encodeURIComponent(userId)}/revoke-tokens`, undefined, opts)
+  }
+
+  /** Outbound webhooks. Server-token only — this is where you register the endpoints feed
+   *  events are delivered to. Storage, HMAC-SHA256 signing, and retries are handled for
+   *  you; `create` returns the signing secret to verify deliveries with. */
+  readonly webhooks = {
+    create: (d: { url: string }, opts: RequestOptions = {}) =>
+      this.call<WebhookDestination>('POST', '/v1/webhooks', d, opts),
+    list: (opts: RequestOptions = {}) => this.call<WebhookDestination[]>('GET', '/v1/webhooks', undefined, opts),
+    remove: (id: string, opts: RequestOptions = {}) =>
+      this.call<void>('DELETE', `/v1/webhooks/${encodeURIComponent(id)}`, undefined, opts),
+  }
+
+  /** Admin reaction ops (server token deletes any user's reaction). */
+  readonly reactions = {
+    delete: (reactionId: string, opts: RequestOptions = {}) =>
+      this.call<void>('DELETE', `/v1/reactions/${encodeURIComponent(reactionId)}`, undefined, opts),
+  }
+
+  feed(group: string, id: string) {
+    const base = `/v1/feeds/${encodeURIComponent(group)}/${encodeURIComponent(id)}`
+    return {
+      addActivity: <TCustom = Record<string, unknown>>(a: Record<string, unknown>, opts: RequestOptions = {}) =>
+        this.call<Activity<TCustom>>('POST', `${base}/activities`, a, opts),
+      get: <TCustom = Record<string, unknown>>(
+        q: { limit?: number; next?: string; /** @deprecated use `next` */ cursor?: string } = {},
+        opts: RequestOptions = {},
+      ) => {
+        const params = new URLSearchParams()
+        if (q.limit !== undefined) params.set('limit', String(q.limit))
+        const token = q.next ?? q.cursor
+        if (token !== undefined) params.set('next', token)
+        const qs = params.toString()
+        return this.call<Page<Activity<TCustom>>>('GET', qs ? `${base}?${qs}` : base, undefined, opts)
+      },
+      followStats: (opts: RequestOptions = {}) =>
+        this.call<FollowStats>('GET', `${base}/stats`, undefined, opts),
+    }
+  }
+}
