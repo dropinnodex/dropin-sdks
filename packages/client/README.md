@@ -29,6 +29,26 @@ const reaction = await client.reactions.add('like', activityId)
 const me = await client.users.me()
 ```
 
+### Live updates with head checks
+
+Poll a cheap change signal instead of a full feed read. Useful for "keep this fresh" UI
+without the cost of re-reading the whole feed every few seconds.
+
+```ts
+// Get the opaque ID of the latest activity or notification
+// Returns { latest: string | null } — null means "nothing new".
+const { latest } = await client.feed('timeline', 'user-123').head()
+const { latest: ntfLatest } = await client.notifications.head()
+
+// Compare with the last value you acted on; a change means fetch the real feed.
+// The string itself is never parsed; only compare for equality.
+```
+
+Runs **only on Redis** — no database hit. `latest` is an opaque token (happens to be the
+newest activity / notification id). Both flows benefit from this: React hooks can buffer
+the work behind a 5-second timer (visible tabs only) to achieve "~5s latency, near-zero
+idle cost" without the infrastructure of a realtime transport.
+
 ### Pointing somewhere else
 
 `url` defaults to `https://api.getnodex.cloud`. Override it for staging, a proxy, or local

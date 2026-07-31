@@ -1,8 +1,16 @@
 {
   "name": "@dropinnodex/server",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Server-side SDK for dropin-activity — mint HS256 user tokens offline, and manage users, feeds, and webhooks from your backend. Node only.",
-  "keywords": ["dropin", "activity-feed", "feed", "webhooks", "jwt", "sdk", "getstream"],
+  "keywords": [
+    "dropin",
+    "activity-feed",
+    "feed",
+    "webhooks",
+    "jwt",
+    "sdk",
+    "getstream"
+  ],
   "license": "MIT",
   "author": "Marko Pavic",
   "homepage": "https://docs.getnodex.cloud",
@@ -20,11 +28,19 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "import": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
-      "require": { "types": "./dist/index.d.cts", "default": "./dist/index.cjs" }
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "engines": {
     "node": ">=20"
   },

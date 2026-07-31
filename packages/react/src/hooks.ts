@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { Activity, Follow, Notification, Page, Reaction, Suggestion } from '@dropinnodex/client'
 import { useDropInContext, useDropInClient, type CacheEntry } from './provider.js'
+import { useLiveTicks } from './use-live.js'
 
 /**
  * Every hook cancels its READS when the component unmounts (or when the feed/activity it
@@ -53,7 +54,15 @@ function isAbort(err: unknown): boolean {
 export function useFeed<TCustom = Record<string, unknown>>(
   group: string,
   id: string,
-  opts?: { initialData?: Page<Activity<TCustom>>; pollInterval?: number },
+  opts?: {
+    initialData?: Page<Activity<TCustom>>
+    /** @deprecated Use `live: true` — cheaper (head check, not a full read) and
+     * visibility-aware. Kept working; ignored when `live` is set. */
+    pollInterval?: number
+    /** Keep this feed fresh: cheap head check every 5s while visible, paused while
+     * hidden, full fetch only when something actually changed. */
+    live?: boolean
+  },
 ) {
   const { client, cache } = useDropInContext()
   const feedKey = `${group}:${id}`
@@ -100,6 +109,7 @@ export function useFeed<TCustom = Record<string, unknown>>(
     let cancelled = false
     const ctrl = new AbortController()
     readCtrl.current = ctrl
+    lastHeadRef.current = null
     // Only flip back to a loading state if we didn't already seed one (cache or
     // initialData) — otherwise a seeded mount would flash a spinner before this
     // background revalidation resolves.
@@ -224,6 +234,27 @@ export function useFeed<TCustom = Record<string, unknown>>(
     }
   }, [client, cache, feedKey, group, id])
 
+  // live: signal-consumption head polling (spec 2026-07-31-live-updates). lastHeadRef is
+  // the last head value ACTED ON — deliberately not compared against list contents: a
+  // deleted activity's id can sit in the head key forever, and comparing against the
+  // list would turn every later tick into a full fetch. Reset on feed switch.
+  const lastHeadRef = useRef<string | null>(null)
+  const headTick = useCallback(async () => {
+    try {
+      const { latest } = await client.feed(group, id).head({ signal: readSignal() })
+      // Mirrors checkNew's guard: the feed this call was checking for may have been
+      // switched away from while the request was in flight — drop it rather than
+      // consuming a head value (or triggering checkNew) against the new feed's state.
+      if (feedKeyRef.current !== feedKey) return
+      if (latest === null || latest === lastHeadRef.current) return
+      lastHeadRef.current = latest // consume BEFORE the fetch — checkNew dedupes races internally
+      await checkNew()
+    } catch {
+      // Hint only — same swallow policy as polling: never touches isLoading/error.
+    }
+  }, [client, group, id, feedKey, checkNew])
+  useLiveTicks(opts?.live === true, () => { void headTick() })
+
   // Prepends the buffered activities into `activities` and clears the buffer.
   const showNew = useCallback(() => {
     const p = pendingRef.current
@@ -239,10 +270,13 @@ export function useFeed<TCustom = Record<string, unknown>>(
   // Auto-polling: disabled unless opts.pollInterval is a positive number. Re-armed
   // whenever the interval or checkNew's identity changes; always cleared on unmount.
   useEffect(() => {
+    // Matches useLiveTicks' arming condition exactly (opts?.live === true) — a truthy
+    // non-boolean `live` must degrade to polling, not silently disable both.
+    if (opts?.live === true) return // live mode owns freshness; the deprecated timer never arms
     if (!opts?.pollInterval || opts.pollInterval <= 0) return
     const t = setInterval(() => { void checkNew() }, opts.pollInterval)
     return () => clearInterval(t)
-  }, [opts?.pollInterval, checkNew])
+  }, [opts?.live, opts?.pollInterval, checkNew])
 
   return {
     activities, loadNext, hasNext: next !== null, isLoading, error, addActivity, refresh,
@@ -252,12 +286,14 @@ export function useFeed<TCustom = Record<string, unknown>>(
 
 /** `useFeed('timeline', uid, opts)` — the feed aggregating who this user follows. */
 export function useTimeline<TCustom = Record<string, unknown>>(
-  uid: string, opts?: { initialData?: Page<Activity<TCustom>>; pollInterval?: number },
+  uid: string,
+  opts?: { initialData?: Page<Activity<TCustom>>; pollInterval?: number; live?: boolean },
 ) { return useFeed<TCustom>('timeline', uid, opts) }
 
 /** `useFeed('user', uid, opts)` — a single user's own activity feed. */
 export function useUserFeed<TCustom = Record<string, unknown>>(
-  uid: string, opts?: { initialData?: Page<Activity<TCustom>>; pollInterval?: number },
+  uid: string,
+  opts?: { initialData?: Page<Activity<TCustom>>; pollInterval?: number; live?: boolean },
 ) { return useFeed<TCustom>('user', uid, opts) }
 
 /** GetStream V3 alias for `useFeed` — same signature and return. */
@@ -604,7 +640,12 @@ export function useSuggestions(group: string, id: string, opts?: { limit?: numbe
  * the rows before the request resolves, rolling back on error — same discipline as
  * useReactions. Pass `pollInterval` to refresh counts on a timer.
  */
-export function useNotifications(opts?: { pollInterval?: number }) {
+export function useNotifications(opts?: {
+  /** @deprecated Use `live: true` — cheaper and visibility-aware. Ignored when `live` is set. */
+  pollInterval?: number
+  /** Keep notifications fresh via the cheap head check. See useFeed's `live`. */
+  live?: boolean
+}) {
   const client = useDropInClient()
   const [notifications, setNotifications] = useState<Notification[]>([])
   const [unseen, setUnseen] = useState(0)
@@ -635,6 +676,18 @@ export function useNotifications(opts?: { pollInterval?: number }) {
   }, [client])
 
   const refresh = useCallback(() => load(readSignal()), [load])
+
+  // Same signal-consumption discipline as useFeed's live mode (spec 2026-07-31-live-updates).
+  const lastHeadRef = useRef<string | null>(null)
+  const headTick = useCallback(async () => {
+    try {
+      const { latest } = await client.notifications.head({ signal: readSignal() })
+      if (latest === null || latest === lastHeadRef.current) return
+      lastHeadRef.current = latest
+      await refresh()
+    } catch { /* hint only — swallowed like poll errors */ }
+  }, [client, refresh])
+  useLiveTicks(opts?.live === true, () => { void headTick() })
 
   useEffect(() => {
     const ctrl = new AbortController()
@@ -693,10 +746,11 @@ export function useNotifications(opts?: { pollInterval?: number }) {
   }, [client, notifications, unread])
 
   useEffect(() => {
+    if (opts?.live === true) return // live mode owns freshness; the deprecated timer never arms
     if (!opts?.pollInterval || opts.pollInterval <= 0) return
     const t = setInterval(() => { void refresh() }, opts.pollInterval)
     return () => clearInterval(t)
-  }, [opts?.pollInterval, refresh])
+  }, [opts?.live, opts?.pollInterval, refresh])
 
   return {
     notifications, unseen, unread, loadNext, hasNext: next !== null,

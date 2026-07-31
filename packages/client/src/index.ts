@@ -236,6 +236,10 @@ export class DropInClient {
       // up by popularity. A capped top-N, so no cursor and no `next`.
       suggestions: (q: { limit?: number } = {}, opts: RequestOptions = {}) =>
         this.call<{ results: Suggestion[] }>('GET', `${base}/suggestions${this.qs({ limit: q.limit })}`, undefined, opts),
+      /** Cheap change signal (Redis-only server-side). `latest` is an opaque token:
+       * compare with the last value you acted on; null means "nothing new". */
+      head: (opts: RequestOptions = {}) =>
+        this.call<{ latest: string | null }>('GET', `${base}/head`, undefined, opts),
     }
   }
 
@@ -298,5 +302,8 @@ export class DropInClient {
     /** Mark specific notifications read, or all when no ids are given (an empty array = all). */
     markRead: (ids?: string[], opts: RequestOptions = {}) =>
       this.call<void>('POST', '/v1/notifications/mark', ids?.length ? { read: ids } : { read: true }, opts),
+    /** Cheap change signal for the caller's notifications. See feed().head(). */
+    head: (opts: RequestOptions = {}) =>
+      this.call<{ latest: string | null }>('GET', '/v1/notifications/head', undefined, opts),
   }
 }

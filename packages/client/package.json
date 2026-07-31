@@ -1,8 +1,17 @@
 {
   "name": "@dropinnodex/client",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Isomorphic, zero-dependency client SDK for dropin-activity — feeds, activities, reactions, and follows over fetch. Browser or Node.",
-  "keywords": ["dropin", "activity-feed", "feed", "reactions", "follows", "sdk", "getstream", "isomorphic"],
+  "keywords": [
+    "dropin",
+    "activity-feed",
+    "feed",
+    "reactions",
+    "follows",
+    "sdk",
+    "getstream",
+    "isomorphic"
+  ],
   "license": "MIT",
   "author": "Marko Pavic",
   "homepage": "https://docs.getnodex.cloud",
@@ -21,13 +30,23 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "import": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
-      "require": { "types": "./dist/index.d.cts", "default": "./dist/index.cjs" }
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "publishConfig": {
     "access": "public"
   },
-  "scripts": { "build": "tsup" }
+  "scripts": {
+    "build": "tsup"
+  }
 }

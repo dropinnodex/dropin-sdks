@@ -23,6 +23,7 @@ function makeClient(over: Record<string, unknown> = {}) {
       addActivity: vi.fn(async () => activity('new')),
       removeActivity: vi.fn(async () => undefined),
       suggestions: vi.fn(async () => ({ results: [] })),
+      head: vi.fn(async () => ({ latest: null })),
     })),
     reactions: {
       add: vi.fn(async () => ({})),
@@ -314,6 +315,102 @@ describe('useFeed', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+})
+
+describe('useFeed live', () => {
+  it('head unchanged → no feed fetch; head changed → exactly one checkNew per distinct value', async () => {
+    vi.useFakeTimers()
+    try {
+      const get = vi.fn(async () => ({ results: [activity('a1')], next: null }))
+      let latest: string | null = null
+      const head = vi.fn(async () => ({ latest }))
+      const client = makeClient({ feed: vi.fn(() => ({ get, head })) })
+      renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(get).toHaveBeenCalledTimes(1) // mount load only
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      expect(head).toHaveBeenCalledTimes(1)
+      expect(get).toHaveBeenCalledTimes(1) // null head = nothing new
+
+      latest = 'a2'
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      expect(get).toHaveBeenCalledTimes(2) // change → checkNew
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+      expect(get).toHaveBeenCalledTimes(2) // same head → signal already consumed
+    } finally { vi.useRealTimers() }
+  })
+
+  it('a deleted head id costs one fetch, never a loop', async () => {
+    vi.useFakeTimers()
+    try {
+      const get = vi.fn(async () => ({ results: [activity('a1')], next: null }))
+      const head = vi.fn(async () => ({ latest: 'gone' }))
+      const client = makeClient({ feed: vi.fn(() => ({ get, head })) })
+      renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      expect(get).toHaveBeenCalledTimes(2) // one consumption fetch
+      await act(async () => { await vi.advanceTimersByTimeAsync(15_000) })
+      expect(get).toHaveBeenCalledTimes(2) // and no more
+    } finally { vi.useRealTimers() }
+  })
+
+  it('live beats pollInterval — the interval timer never arms', async () => {
+    vi.useFakeTimers()
+    try {
+      const get = vi.fn(async () => ({ results: [activity('a1')], next: null }))
+      const head = vi.fn(async () => ({ latest: null }))
+      const client = makeClient({ feed: vi.fn(() => ({ get, head })) })
+      renderHook(() => useFeed('user', 'alice', { live: true, pollInterval: 1000 }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+      expect(get).toHaveBeenCalledTimes(1) // pollInterval alone would have fetched ~10 more times
+      expect(head).toHaveBeenCalledTimes(2)
+    } finally { vi.useRealTimers() }
+  })
+
+  it('head errors are swallowed like poll errors — no error state, ticks continue', async () => {
+    vi.useFakeTimers()
+    try {
+      const get = vi.fn(async () => ({ results: [activity('a1')], next: null }))
+      const head = vi.fn(async () => { throw new Error('boom') })
+      const client = makeClient({ feed: vi.fn(() => ({ get, head })) })
+      const { result } = renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+      expect(head).toHaveBeenCalledTimes(2)
+      expect(result.current.error).toBeNull()
+    } finally { vi.useRealTimers() }
+  })
+
+  it('feed switch resets lastHeadRef — the same head value is treated as new again for the new feed', async () => {
+    vi.useFakeTimers()
+    try {
+      const get = vi.fn(async () => ({ results: [activity('a1')], next: null }))
+      const head = vi.fn(async () => ({ latest: 'x1' }))
+      const client = makeClient({ feed: vi.fn(() => ({ get, head })) })
+      const { rerender } = renderHook(
+        ({ id }: { id: string }) => useFeed('user', id, { live: true }),
+        { initialProps: { id: 'alice' }, wrapper: wrapper(client) },
+      )
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(get).toHaveBeenCalledTimes(1) // alice mount load
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      expect(get).toHaveBeenCalledTimes(2) // alice consumes head 'x1'
+
+      rerender({ id: 'bob' })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(get).toHaveBeenCalledTimes(3) // bob mount load, post-switch
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      // Still 'x1' — but bob's lastHeadRef was reset to null on the switch, so the SAME
+      // value must be consumed again rather than being (wrongly) treated as already-seen.
+      expect(get).toHaveBeenCalledTimes(4)
+    } finally { vi.useRealTimers() }
   })
 })
 
@@ -616,6 +713,61 @@ describe('useNotifications', () => {
     const { result } = renderHook(() => useNotifications(), { wrapper: wrapper(client) })
     await waitFor(() => expect(result.current.error).not.toBeNull())
     expect(result.current.isLoading).toBe(false)
+  })
+})
+
+describe('useNotifications live', () => {
+  const page = { results: [], unseen: 0, unread: 0, next: null }
+
+  it('refreshes only when the notification head changes', async () => {
+    vi.useFakeTimers()
+    try {
+      const get = vi.fn(async () => page)
+      let latest: string | null = null
+      const head = vi.fn(async () => ({ latest }))
+      const client = makeClient({ notifications: { get, head } })
+      renderHook(() => useNotifications({ live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(get).toHaveBeenCalledTimes(1) // mount load
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      expect(get).toHaveBeenCalledTimes(1) // null head → nothing
+
+      latest = 'ntf_1'
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      expect(get).toHaveBeenCalledTimes(2) // change → refresh
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+      expect(get).toHaveBeenCalledTimes(2) // consumed
+    } finally { vi.useRealTimers() }
+  })
+
+  it('live beats pollInterval', async () => {
+    vi.useFakeTimers()
+    try {
+      const get = vi.fn(async () => page)
+      const head = vi.fn(async () => ({ latest: null }))
+      const client = makeClient({ notifications: { get, head } })
+      renderHook(() => useNotifications({ live: true, pollInterval: 1000 }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+      expect(get).toHaveBeenCalledTimes(1)
+    } finally { vi.useRealTimers() }
+  })
+
+  it('head errors are swallowed like poll errors — no error state, ticks continue', async () => {
+    vi.useFakeTimers()
+    try {
+      const get = vi.fn(async () => page)
+      const head = vi.fn(async () => { throw new Error('boom') })
+      const client = makeClient({ notifications: { get, head } })
+      const { result } = renderHook(() => useNotifications({ live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+      expect(head).toHaveBeenCalledTimes(2)
+      expect(result.current.error).toBeNull()
+      expect(get).toHaveBeenCalledTimes(1) // mount only
+    } finally { vi.useRealTimers() }
   })
 })
 

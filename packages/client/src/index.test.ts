@@ -430,3 +430,19 @@ describe('base URL', () => {
     expect(DEFAULT_API_URL.endsWith('/')).toBe(false)
   })
 })
+
+describe('head', () => {
+  it('feed head hits /head and returns the token', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, { latest: 'act_9' }))
+    const r = await client(async () => 't').feed('timeline', 'alice').head()
+    expect(lastUrl()).toBe('http://api.test/v1/feeds/timeline/alice/head')
+    expect(r).toEqual({ latest: 'act_9' })
+  })
+
+  it('notifications head hits /v1/notifications/head', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, { latest: null }))
+    const r = await client(async () => 't').notifications.head()
+    expect(lastUrl()).toBe('http://api.test/v1/notifications/head')
+    expect(r).toEqual({ latest: null })
+  })
+})

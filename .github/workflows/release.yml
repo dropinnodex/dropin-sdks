@@ -34,7 +34,13 @@ jobs:
       # and specifying both is a hard error ("Multiple versions of pnpm specified") the
       # moment the two disagree — a failure that would land only AFTER the release commit is
       # public, which is exactly what the drift guard exists to prevent. One source of truth.
-      - uses: pnpm/action-setup@v4
+      #
+      # v6, not v4: v6.0.0 is the release that "added support for pnpm v11", and this
+      # workspace pins pnpm@11.1.3. v6.0.6 additionally fixed `bin_dest` pointing at the
+      # bootstrap pnpm instead of the self-updated one — i.e. on v4 the pnpm that actually
+      # runs is not necessarily the pinned one, which is how pnpm/pnpm#11566 saw OIDC
+      # publishes fail with a masked 404.
+      - uses: pnpm/action-setup@v6
 
       - uses: actions/setup-node@v4
         with:
@@ -63,11 +69,15 @@ jobs:
     runs-on: ubuntu-latest
     # A gate on a HUMAN, and one that now fires only after CI is green. This repo is public
     # and a merged pull request is a push to main, so without this a merge is enough to
-    # reach NODE_AUTH_TOKEN — either through a package lifecycle script that
+    # reach the publish step — either through a package lifecycle script that
     # `pnpm -r publish` runs, or by having an earlier step create a fourth package for `-r`
     # to enumerate. Configure `npm-publish` in Settings → Environments with a required
     # reviewer. Branch protection is NOT the control here: requiring pull requests on main
     # would reject the release script's direct push.
+    #
+    # This name is also load-bearing on npm's side: each package's trusted publisher pins
+    # the environment, and the OIDC claim must match it. Renaming it here without renaming
+    # it on all three packages turns every publish into a masked 404.
     environment: npm-publish
     permissions:
       contents: read
@@ -79,7 +89,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
 
       - uses: actions/setup-node@v4
         with:
@@ -89,6 +99,8 @@ jobs:
           # CONSUMERS of the published packages need, not what builds them.
           node-version: 22
           cache: pnpm
+          # Still needed without a token: it writes the .npmrc that tells pnpm which
+          # registry to run the OIDC exchange against.
           registry-url: https://registry.npmjs.org
 
       - run: pnpm install --frozen-lockfile
@@ -96,8 +108,21 @@ jobs:
       # Rebuilt here because jobs do not share a filesystem — verify's dist/ is gone.
       - run: pnpm -r build
 
+      # No auth token, and no secret of any kind: npm trusted publishing is configured
+      # on each of the three packages (org dropinnodex / repo dropin-sdks / this workflow
+      # filename / environment npm-publish), so pnpm exchanges the job's OIDC id-token for a
+      # short-lived registry token at publish time. Nothing long-lived exists to leak, and a
+      # failed exchange fails the step rather than falling back to anything.
+      #
+      # Keep the pnpm pin at >= 11.1.0. Before pnpm/pnpm#11495 (merged 2026-05-06, so absent
+      # from 11.0.x) pnpm abandoned the OIDC exchange the moment an _authToken was
+      # configured at all — and setup-node's registry-url always writes an _authToken line,
+      # whether or not anything fills it in. That is how the earlier version of this
+      # workflow could have published under token auth with no trustedPublisher and no
+      # attestation, silently. 11.1.3 removes the bail-out entirely.
+      #
       # --no-git-checks: the build above wrote dist/, so the tree is dirty and pnpm would
       # otherwise refuse. Nothing reaches npm that the verify job did not pass.
+      # --provenance is redundant under trusted publishing (attestations are automatic) but
+      # kept so a fallback to any other auth path still produces one.
       - run: pnpm -r publish --provenance --access public --no-git-checks
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -1,8 +1,17 @@
 {
   "name": "@dropinnodex/react",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "React hooks for dropin-activity — feeds, reactions, and follows with optimistic updates and rollback.",
-  "keywords": ["dropin", "activity-feed", "feed", "react", "hooks", "sdk", "getstream", "optimistic"],
+  "keywords": [
+    "dropin",
+    "activity-feed",
+    "feed",
+    "react",
+    "hooks",
+    "sdk",
+    "getstream",
+    "optimistic"
+  ],
   "license": "MIT",
   "author": "Marko Pavic",
   "homepage": "https://docs.getnodex.cloud",
@@ -21,11 +30,19 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "import": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
-      "require": { "types": "./dist/index.d.cts", "default": "./dist/index.cjs" }
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "publishConfig": {
     "access": "public"
   },

@@ -1,5 +1,26 @@
 # @dropinnodex/react
 
+## 0.2.0
+
+### Minor Changes
+
+- f367981: Live mode and follow suggestions.
+
+  - **client:** `feed().head()` and `notifications().head()` change-signal reads;
+    `feed().suggestions()` with the `Suggestion` type; API base URL now defaults to
+    the hosted endpoint (GetStream-style — pass `baseUrl` to override); `AbortSignal`
+    accepted on every method; typed webhook destination helpers.
+  - **react:** `live: true` on `useFeed` and `useNotifications` — visibility-aware
+    head-check polling that refetches only when the head id changes; new
+    `useSuggestions` hook.
+  - **server:** republished under the same minor for lockstep versioning; no API
+    changes beyond shared metadata.
+
+### Patch Changes
+
+- Updated dependencies [f367981]
+  - @dropinnodex/client@0.2.0
+
 ## 0.1.0
 
 ### Minor Changes

@@ -203,16 +203,14 @@ function WhoToFollow({ uid }: { uid: string }) {
 popularity fill). After the viewer follows someone, call `refresh()` to drop them from the
 list.
 
-### "New posts ↑" without realtime
+### Live updates and polling
 
-There is no websocket/SSE (by design). To get the familiar "N new posts" pill, `useFeed`
-(and `useTimeline`/`useUserFeed`) can **poll and buffer**: new activities are held aside —
-not auto-prepended, which would jump the feed mid-scroll — and surfaced as a count you
-flush on click.
+There is no websocket/SSE (by design). To keep feeds fresh, use **`live: true`** for a cheap
+change signal every 5 seconds while your tab is visible (paused when hidden):
 
 ```tsx
 function TimelineWithPill({ uid }) {
-  const { activities, newCount, showNew } = useTimeline(uid, { pollInterval: 15000 })
+  const { activities, newCount, showNew, isLoading } = useTimeline(uid, { live: true })
   return (
     <>
       {newCount > 0 && (
@@ -224,12 +222,23 @@ function TimelineWithPill({ uid }) {
 }
 ```
 
-- `pollInterval` (ms) checks in the background; omit it and call `checkNew()` yourself (on
-  tab focus, pull-to-refresh, a button).
-- `newCount` is a client-side diff of page 1, so it's **capped at the page size (20)** —
-  display `20+`. (The read path never runs a realtime `COUNT`.)
+On a detected change, `useFeed` buffers new items behind `newCount`/`showNew` (no loading
+flicker), so you get the familiar "N new posts" pill. Internally, `live` runs one cheap
+Redis check per tick; a real fetch only happens if something changed.
+
+**`pollInterval` (deprecated).** The older approach does a full feed read every tick, even
+in hidden tabs, costing 3 SQL statements per check. Still works for backward compatibility,
+but `live` is strongly recommended — it costs ~1% as much.
+
+```tsx
+// Old style — not recommended
+const { activities, newCount, showNew } = useTimeline(uid, { pollInterval: 15000 })
+```
+
+- `newCount` is a client-side diff of page 1, **capped at the page size (20)** — display `20+`.
 - `showNew()` prepends the buffered posts and clears the count. Your own `addActivity`
   posts are already shown, so they never count as "new".
+- With `live: true`, no need to set `pollInterval`; `live` takes precedence if both are passed.
 
 ### Notifications
 
@@ -239,12 +248,15 @@ when someone follows them or reacts to their post — and keeps `unseen`/`unread
 `useReactions`: they update the local counter and stamp the rows before the request
 resolves, reverting if it fails, and self-correcting on the next refresh.
 
+Keep notifications fresh with **`live: true`** for cheap change checks every 5 seconds
+(paused when hidden):
+
 ```tsx
 import { useNotifications } from '@dropinnodex/react'
 
 function NotificationBell() {
-  const { notifications, unseen, unread, markSeen, markRead, loadNext, hasNext } =
-    useNotifications({ pollInterval: 30000 })
+  const { notifications, unseen, unread, markSeen, markRead, loadNext, hasNext, isLoading } =
+    useNotifications({ live: true })
 
   return (
     <details>
@@ -262,15 +274,20 @@ function NotificationBell() {
 }
 ```
 
+With `live: true`, the list is refreshed (`isLoading` cycles, `error` can surface) only when
+something actually changed; nothing runs while the tab is hidden.
+
+**`pollInterval` (deprecated).** The older approach does a full refresh every tick. Still works
+for backward compatibility, but `live` is recommended for better UX and lower server cost.
+
 Returns `{ notifications, unseen, unread, loadNext, hasNext, isLoading, error, markSeen,
 markRead, refresh }`.
 
 - `markSeen()` / `markRead()` with **no ids (or an empty array) mark ALL**; pass an id array
   to mark specific ones. `seen` and `read` are tracked independently.
-- `pollInterval` (ms) refreshes counts in the background — same no-websocket-by-design
-  stance as the feed pill above. Omit it and call `refresh()` yourself (tab focus, a button).
 - Counts are server-authoritative; the optimistic decrement is a display
-  convenience that reconciles to the server on the next `refresh`/poll.
+  convenience that reconciles to the server on the next `refresh`.
+- With `live: true`, no need to set `pollInterval`; `live` takes precedence if both are passed.
 
 ## Cancellation on unmount
 
