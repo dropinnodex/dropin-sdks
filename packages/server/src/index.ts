@@ -63,6 +63,11 @@ export interface DropInServerOptions {
    * at staging, a proxy, or a local server — e.g. `http://localhost:3000`. No trailing slash.
    */
   url?: string | undefined
+  /** Upper bound for every request this SDK makes, in ms. Default 10_000. A hung
+   *  feed API must never stall YOUR request path (a Cloud Functions callable
+   *  awaiting this SDK would otherwise ride to the platform's own timeout).
+   *  Passing `signal` in RequestOptions replaces this bound entirely. */
+  timeoutMs?: number
 }
 
 export interface TokenOptions {
@@ -121,6 +126,9 @@ export class DropInServer {
     const { signal } = opts
     // Bail before signing a token for a call the caller has already given up on.
     if (signal?.aborted) throw signal.reason ?? new DOMException('The operation was aborted.', 'AbortError')
+    // Caller-supplied signal replaces the default bound entirely — whoever owns
+    // cancellation owns it fully (spec §2, dx-round3).
+    const effectiveSignal = signal ?? AbortSignal.timeout(this.opts.timeoutMs ?? 10_000)
     const token = await this.createServerToken()
     // Fall back to the global fetch at call time (not construction) so tests that swap
     // globalThis.fetch after building the client still take effect.
@@ -133,8 +141,7 @@ export class DropInServer {
         ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
       },
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
-      // Omitted entirely when absent: some fetch polyfills choke on `signal: undefined`.
-      ...(signal !== undefined ? { signal } : {}),
+      signal: effectiveSignal,
     })
     if (!res.ok) {
       const text = await res.text()
@@ -200,8 +207,13 @@ export class DropInServer {
   feed(group: string, id: string) {
     const base = `/v1/feeds/${encodeURIComponent(group)}/${encodeURIComponent(id)}`
     return {
-      addActivity: <TCustom = Record<string, unknown>>(a: Record<string, unknown>, opts: RequestOptions = {}) =>
-        this.call<Activity<TCustom>>('POST', `${base}/activities`, a, opts),
+      addActivity: <TCustom = Record<string, unknown>>(a: {
+        /** Server tokens set the actor explicitly (e.g. "user:alice"); user tokens
+         *  have it overwritten by the gateway (spec §5). */
+        actor?: string
+        verb: string; object: string; target?: string | null
+        foreign_id?: string | null; time?: string; custom?: TCustom
+      }, opts: RequestOptions = {}) => this.call<Activity<TCustom>>('POST', `${base}/activities`, a, opts),
       get: <TCustom = Record<string, unknown>>(
         q: { limit?: number; next?: string; /** @deprecated use `next` */ cursor?: string } = {},
         opts: RequestOptions = {},

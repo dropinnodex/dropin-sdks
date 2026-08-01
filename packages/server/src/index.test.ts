@@ -273,10 +273,12 @@ describe('AbortSignal', () => {
     expect((lastCall(fn)[1] as unknown as { signal: AbortSignal }).signal).toBe(ctrl.signal)
   })
 
-  it('omits signal from the fetch init when none is given', async () => {
+  it('attaches the default timeout signal when none is given (dx-round3 spec §2)', async () => {
     const fn = mockFetchOnce({ status: 200, json: { id: 'alice', custom: {} } })
     await dropin.upsertUser({ id: 'alice' })
-    expect(lastCall(fn)[1]).not.toHaveProperty('signal')
+    const { signal } = lastCall(fn)[1] as unknown as { signal?: AbortSignal }
+    expect(signal).toBeInstanceOf(AbortSignal)
+    expect(signal!.aborted).toBe(false)
   })
 
   it('rejects an already-aborted call without signing a token or calling fetch', async () => {
@@ -334,5 +336,34 @@ describe('base URL', () => {
   it('points at https, so a default install is never plaintext', () => {
     expect(DEFAULT_API_URL.startsWith('https://')).toBe(true)
     expect(DEFAULT_API_URL.endsWith('/')).toBe(false)
+  })
+})
+
+describe('request timeout', () => {
+  it('attaches a default timeout signal when the caller passes none', async () => {
+    const fn = mockFetchOnce({ status: 200, json: { results: [] } })
+    await dropin.batch.users([{ id: 'a' }])
+    const [, opts] = lastCall(fn)
+    expect((opts as { signal?: AbortSignal }).signal).toBeInstanceOf(AbortSignal)
+  })
+
+  it('a caller-supplied signal replaces the default entirely', async () => {
+    const fn = mockFetchOnce({ status: 200, json: { results: [] } })
+    const ac = new AbortController()
+    await dropin.batch.users([{ id: 'a' }], { signal: ac.signal })
+    const [, opts] = lastCall(fn)
+    expect((opts as { signal?: AbortSignal }).signal).toBe(ac.signal)
+  })
+
+  it('timeoutMs option bounds a hanging request', async () => {
+    const short = new DropInServer({
+      tenantId: 'acme', apiKey: 'dk_test', apiSecret: 'ds_test_secret',
+      url: 'http://localhost:3000', timeoutMs: 20,
+    })
+    vi.stubGlobal('fetch', vi.fn((_url: string, init: { signal?: AbortSignal }) =>
+      new Promise((_resolve, reject) => {
+        init.signal?.addEventListener('abort', () => reject(init.signal!.reason))
+      })))
+    await expect(short.batch.users([{ id: 'a' }])).rejects.toThrow(/timeout|abort/i)
   })
 })

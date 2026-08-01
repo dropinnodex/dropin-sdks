@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { Activity, Follow, Notification, Page, Reaction, Suggestion } from '@dropinnodex/client'
-import { useDropInContext, useDropInClient, type CacheEntry } from './provider.js'
+import { useDropInContext, useDropInClientOrNull, type CacheEntry } from './provider.js'
 import { useLiveTicks } from './use-live.js'
 
 /**
@@ -11,6 +11,14 @@ import { useLiveTicks } from './use-live.js'
  *
  * An abort is the caller's own doing, so it is swallowed rather than surfaced through
  * `error`: unmounting a component is not a failure the (now-gone) UI should report.
+ *
+ * DISABLED MODE (`<DropInProvider enabled={false}>`): the provider carries `client: null`
+ * and every hook goes inert — the shared guard is the `client === null` check each
+ * effect/callback performs before touching the network. Data hooks return their normal
+ * shape with empty data, `isLoading: false`, `error: null`; action functions no-op and
+ * RESOLVE to `undefined` (never reject — disabled mode exists precisely so the feed can
+ * never break the host app's flow). Every hook return carries `enabled: boolean` as the
+ * signal for apps that care; `useDropInEnabled()` is the standalone version.
  */
 function isAbort(err: unknown): boolean {
   return err instanceof Error && err.name === 'AbortError'
@@ -50,6 +58,10 @@ function isAbort(err: unknown): boolean {
  * `newCount` reaches that page size. `checkNew()` is best-effort when driven by
  * `pollInterval`'s timer: a failed poll is swallowed and never touches `isLoading`/`error` —
  * a transient background failure must not blank an otherwise-working feed.
+ *
+ * Inside a disabled provider (`enabled={false}`) the hook is inert: empty `activities`,
+ * `isLoading: false`, `error: null`, `enabled: false`, all functions no-op resolving
+ * `undefined`, zero network — `initialData` and polling are ignored too.
  */
 export function useFeed<TCustom = Record<string, unknown>>(
   group: string,
@@ -65,6 +77,7 @@ export function useFeed<TCustom = Record<string, unknown>>(
   },
 ) {
   const { client, cache } = useDropInContext()
+  const enabled = client !== null
   const feedKey = `${group}:${id}`
   // The cache is intentionally shared/untyped (one CacheEntry — fixed to the default
   // TCustom — serves every TCustom a caller might use across the app), so both the read
@@ -78,12 +91,14 @@ export function useFeed<TCustom = Record<string, unknown>>(
   // back should prefer what we actually fetched over the now-stale SSR payload).
   const cached = cache.get(feedKey) as Entry | undefined
   const setCache = (entry: Entry) => cache.set(feedKey, entry as CacheEntry)
-  const seed: Entry | undefined = cached ?? (opts?.initialData
+  // Disabled mode ignores seeds too: the contract is EMPTY data, not "whatever
+  // initialData happened to carry" — inert must be predictable.
+  const seed: Entry | undefined = !enabled ? undefined : cached ?? (opts?.initialData
     ? { activities: opts.initialData.results, next: opts.initialData.next }
     : undefined)
   const [activities, setActivities] = useState<Activity<TCustom>[]>(seed?.activities ?? [])
   const [next, setNext] = useState<string | null>(seed?.next ?? null)
-  const [isLoading, setLoading] = useState(seed === undefined)
+  const [isLoading, setLoading] = useState(enabled && seed === undefined)
   const [error, setError] = useState<Error | null>(null)
   // Buffer for checkNew()/showNew() — activities polled in but not yet flushed into
   // `activities`. Refs mirror the latest state so checkNew (a useCallback with a stable
@@ -106,6 +121,7 @@ export function useFeed<TCustom = Record<string, unknown>>(
   const readSignal = () => readCtrl.current?.signal
 
   useEffect(() => {
+    if (client === null) return // disabled provider — inert, zero network
     let cancelled = false
     const ctrl = new AbortController()
     readCtrl.current = ctrl
@@ -142,7 +158,7 @@ export function useFeed<TCustom = Record<string, unknown>>(
   }, [client, cache, feedKey, group, id])
 
   const loadNext = useCallback(async () => {
-    if (next === null) return
+    if (client === null || next === null) return
     const signal = readSignal()
     setLoading(true)
     try {
@@ -162,6 +178,7 @@ export function useFeed<TCustom = Record<string, unknown>>(
 
   const addActivity = useCallback(
     async (a: { verb: string; object: string; target?: string | null; foreign_id?: string | null; time?: string; custom?: TCustom }) => {
+      if (client === null) return undefined // disabled — no-op resolving undefined
       const created = await client.feed(group, id).addActivity<TCustom>(a)
       setActivities((prev) => {
         const merged = [created, ...prev]
@@ -174,6 +191,7 @@ export function useFeed<TCustom = Record<string, unknown>>(
   )
 
   const refresh = useCallback(async () => {
+    if (client === null) return
     const signal = readSignal()
     setLoading(true)
     setError(null)
@@ -198,6 +216,7 @@ export function useFeed<TCustom = Record<string, unknown>>(
   // decides when to call showNew()). Deduped by id against both the shown activities and
   // anything already pending, so a round-tripped addActivity is never double-counted.
   const checkNew = useCallback(async () => {
+    if (client === null) return
     // Best-effort: this runs unattended off a timer, so a transient failure (network
     // blip, expired token) must not surface as an unhandled rejection or blank a working
     // feed — swallow it silently, same spirit as stale-while-revalidate. Never setError.
@@ -240,6 +259,7 @@ export function useFeed<TCustom = Record<string, unknown>>(
   // list would turn every later tick into a full fetch. Reset on feed switch.
   const lastHeadRef = useRef<string | null>(null)
   const headTick = useCallback(async () => {
+    if (client === null) return
     try {
       const { latest } = await client.feed(group, id).head({ signal: readSignal() })
       // Mirrors checkNew's guard: the feed this call was checking for may have been
@@ -280,7 +300,7 @@ export function useFeed<TCustom = Record<string, unknown>>(
 
   return {
     activities, loadNext, hasNext: next !== null, isLoading, error, addActivity, refresh,
-    newCount: pending.length, showNew, checkNew,
+    newCount: pending.length, showNew, checkNew, enabled,
   }
 }
 
@@ -299,16 +319,19 @@ export function useUserFeed<TCustom = Record<string, unknown>>(
 /** GetStream V3 alias for `useFeed` — same signature and return. */
 export const useFeedActivities = useFeed
 
+/** Optimistic like/unlike counters. Inside a disabled provider, `react`/`unreact` are
+ *  full no-ops resolving `undefined` (no optimistic bump either) and `enabled` is false. */
 export function useReactions(
   activityId: string,
   initialCounts: Record<string, number> = {},
   initialOwn: string[] = [],
 ) {
-  const client = useDropInClient()
+  const client = useDropInClientOrNull()
   const [counts, setCounts] = useState(initialCounts)
   const [ownReactions, setOwn] = useState(initialOwn)
 
   const react = useCallback(async (kind: string) => {
+    if (client === null) return // disabled — no optimistic write, no network
     const prevCounts = counts
     const prevOwn = ownReactions
     // Optimistic.
@@ -324,6 +347,7 @@ export function useReactions(
   }, [client, activityId, counts, ownReactions])
 
   const unreact = useCallback(async (kind: string) => {
+    if (client === null) return // disabled — no optimistic write, no network
     const prevCounts = counts
     const prevOwn = ownReactions
     // Math.max(...,0): the server floors at 0 too — the UI must not disagree.
@@ -338,26 +362,28 @@ export function useReactions(
     }
   }, [client, activityId, counts, ownReactions])
 
-  return { react, unreact, counts, ownReactions }
+  return { react, unreact, counts, ownReactions, enabled: client !== null }
 }
 
 /**
  * Loads the reaction list for an activity (the "who reacted" list — distinct from
  * `useReactions`, which is the optimistic like/unlike counter). Paginates via `loadNext`;
  * `remove(reactionId)` deletes a reaction by id with an optimistic drop + rollback.
+ * Inert (empty list, no network, `enabled: false`) inside a disabled provider.
  */
 export function useReactionList(activityId: string, opts?: { kind?: string }) {
-  const client = useDropInClient()
+  const client = useDropInClientOrNull()
   const kind = opts?.kind
   const [reactions, setReactions] = useState<Reaction[]>([])
   const [next, setNext] = useState<string | null>(null)
-  const [isLoading, setLoading] = useState(true)
+  const [isLoading, setLoading] = useState(client !== null)
   const [error, setError] = useState<Error | null>(null)
   // Lifetime of this activityId/kind read — aborted on unmount or when either changes.
   const readCtrl = useRef<AbortController | null>(null)
   const readSignal = () => readCtrl.current?.signal
 
   const load = useCallback(async (signal?: AbortSignal) => {
+    if (client === null) return // disabled provider — inert, zero network
     setLoading(true)
     setError(null)
     try {
@@ -384,7 +410,7 @@ export function useReactionList(activityId: string, opts?: { kind?: string }) {
   }, [load])
 
   const loadNext = useCallback(async () => {
-    if (next === null) return
+    if (client === null || next === null) return
     const signal = readSignal()
     setLoading(true)
     try {
@@ -401,6 +427,7 @@ export function useReactionList(activityId: string, opts?: { kind?: string }) {
   }, [client, activityId, kind, next])
 
   const remove = useCallback(async (reactionId: string) => {
+    if (client === null) return // disabled — no optimistic drop, no network
     const prev = reactions
     setReactions((rs) => rs.filter((r) => r.id !== reactionId))
     try {
@@ -411,11 +438,13 @@ export function useReactionList(activityId: string, opts?: { kind?: string }) {
     }
   }, [client, reactions])
 
-  return { reactions, loadNext, hasNext: next !== null, isLoading, error, remove, refresh }
+  return { reactions, loadNext, hasNext: next !== null, isLoading, error, remove, refresh, enabled: client !== null }
 }
 
+/** Optimistic follow/unfollow with server hydration. Inside a disabled provider,
+ *  `follow`/`unfollow` no-op resolve `undefined`, nothing hydrates, `enabled` is false. */
 export function useFollow(group: string, id: string) {
-  const client = useDropInClient()
+  const client = useDropInClientOrNull()
   const [edges, setEdges] = useState<Set<string>>(new Set())
   // Keys the user has optimistically follow()'d or unfollow()'d this session. Hydration
   // (below) must never override these with server state — see the effect's comment for why.
@@ -438,6 +467,7 @@ export function useFollow(group: string, id: string) {
   // user's own optimistic value win for any key they've acted on, while untouched keys
   // (e.g. carol, whom the user never touched) still hydrate in normally.
   useEffect(() => {
+    if (client === null) return // disabled provider — inert, zero network
     let cancelled = false
     const ctrl = new AbortController()
     // async/await + try/catch, NOT `.then().catch()`: a mock (or a real client bug) that
@@ -472,6 +502,7 @@ export function useFollow(group: string, id: string) {
   const isFollowing = useCallback((tGroup: string, tId: string) => edges.has(`${tGroup}:${tId}`), [edges])
 
   const follow = useCallback(async (tGroup: string, tId: string) => {
+    if (client === null) return // disabled — no optimistic write, no network
     const key = `${tGroup}:${tId}`
     const prev = edges
     touched.current.add(key)
@@ -485,6 +516,7 @@ export function useFollow(group: string, id: string) {
   }, [client, group, id, edges])
 
   const unfollow = useCallback(async (tGroup: string, tId: string) => {
+    if (client === null) return // disabled — no optimistic write, no network
     const key = `${tGroup}:${tId}`
     const prev = edges
     touched.current.add(key)
@@ -497,17 +529,19 @@ export function useFollow(group: string, id: string) {
     }
   }, [client, group, id, edges])
 
-  return { follow, unfollow, isFollowing }
+  return { follow, unfollow, isFollowing, enabled: client !== null }
 }
 
-/** The list of feeds `group:id` currently follows (hydrated from the server). */
+/** The list of feeds `group:id` currently follows (hydrated from the server).
+ *  Inert (empty list, no network, `enabled: false`) inside a disabled provider. */
 export function useFollowing(group: string, id: string) {
-  const client = useDropInClient()
+  const client = useDropInClientOrNull()
   const [following, setFollowing] = useState<Array<{ group: string; id: string }>>([])
-  const [isLoading, setLoading] = useState(true)
+  const [isLoading, setLoading] = useState(client !== null)
   const [error, setError] = useState<Error | null>(null)
 
   const load = useCallback(async (signal?: AbortSignal) => {
+    if (client === null) return // disabled provider — inert, zero network
     setLoading(true)
     setError(null)
     try {
@@ -529,18 +563,20 @@ export function useFollowing(group: string, id: string) {
     return () => ctrl.abort()
   }, [load])
 
-  return { following, isLoading, error, refresh }
+  return { following, isLoading, error, refresh, enabled: client !== null }
 }
 
 /** The list of feeds that follow `group:id` (hydrated from the server). Mirror of
- *  `useFollowing`, reading the follower side (`source_*`) of each edge. */
+ *  `useFollowing`, reading the follower side (`source_*`) of each edge.
+ *  Inert (empty list, no network, `enabled: false`) inside a disabled provider. */
 export function useFollowers(group: string, id: string) {
-  const client = useDropInClient()
+  const client = useDropInClientOrNull()
   const [followers, setFollowers] = useState<Array<{ group: string; id: string }>>([])
-  const [isLoading, setLoading] = useState(true)
+  const [isLoading, setLoading] = useState(client !== null)
   const [error, setError] = useState<Error | null>(null)
 
   const load = useCallback(async (signal?: AbortSignal) => {
+    if (client === null) return // disabled provider — inert, zero network
     setLoading(true)
     setError(null)
     try {
@@ -561,18 +597,20 @@ export function useFollowers(group: string, id: string) {
     return () => ctrl.abort()
   }, [load])
 
-  return { followers, isLoading, error, refresh }
+  return { followers, isLoading, error, refresh, enabled: client !== null }
 }
 
-/** Follower/following counts for `group:id` (denormalized server-side). */
+/** Follower/following counts for `group:id` (denormalized server-side).
+ *  Inert (zero counts, no network, `enabled: false`) inside a disabled provider. */
 export function useFollowStats(group: string, id: string) {
-  const client = useDropInClient()
+  const client = useDropInClientOrNull()
   const [followerCount, setFollowerCount] = useState(0)
   const [followingCount, setFollowingCount] = useState(0)
-  const [isLoading, setLoading] = useState(true)
+  const [isLoading, setLoading] = useState(client !== null)
   const [error, setError] = useState<Error | null>(null)
 
   const load = useCallback(async (signal?: AbortSignal) => {
+    if (client === null) return // disabled provider — inert, zero network
     setLoading(true)
     try {
       const s = await client.feed(group, id).followStats({ signal })
@@ -594,7 +632,7 @@ export function useFollowStats(group: string, id: string) {
     return () => ctrl.abort()
   }, [load])
 
-  return { followerCount, followingCount, isLoading, error, refresh }
+  return { followerCount, followingCount, isLoading, error, refresh, enabled: client !== null }
 }
 
 /**
@@ -602,15 +640,17 @@ export function useFollowStats(group: string, id: string) {
  * ranked by mutual overlap, topped up by popularity). Read-only: hydrates on mount
  * and whenever `group`/`id`/`limit` change, with a `refresh` to re-read. Not paginated
  * (the endpoint returns a capped top-N), so there is no `loadNext`/`hasNext`.
+ * Inert (empty list, no network, `enabled: false`) inside a disabled provider.
  */
 export function useSuggestions(group: string, id: string, opts?: { limit?: number }) {
-  const client = useDropInClient()
+  const client = useDropInClientOrNull()
   const limit = opts?.limit
   const [suggestions, setSuggestions] = useState<Suggestion[]>([])
-  const [isLoading, setLoading] = useState(true)
+  const [isLoading, setLoading] = useState(client !== null)
   const [error, setError] = useState<Error | null>(null)
 
   const load = useCallback(async (signal?: AbortSignal) => {
+    if (client === null) return // disabled provider — inert, zero network
     setLoading(true)
     setError(null)
     try {
@@ -631,7 +671,7 @@ export function useSuggestions(group: string, id: string, opts?: { limit?: numbe
     return () => ctrl.abort()
   }, [load])
 
-  return { suggestions, isLoading, error, refresh }
+  return { suggestions, isLoading, error, refresh, enabled: client !== null }
 }
 
 /**
@@ -639,6 +679,9 @@ export function useSuggestions(group: string, id: string, opts?: { limit?: numbe
  * are optimistic: they zero (mark-all) or decrement (mark-ids) the local counter and stamp
  * the rows before the request resolves, rolling back on error — same discipline as
  * useReactions. Pass `pollInterval` to refresh counts on a timer.
+ *
+ * Inert inside a disabled provider: empty list, zero counts, `isLoading: false`,
+ * `error: null`, `enabled: false`; `markSeen`/`markRead` no-op resolve `undefined`.
  */
 export function useNotifications(opts?: {
   /** @deprecated Use `live: true` — cheaper and visibility-aware. Ignored when `live` is set. */
@@ -646,12 +689,12 @@ export function useNotifications(opts?: {
   /** Keep notifications fresh via the cheap head check. See useFeed's `live`. */
   live?: boolean
 }) {
-  const client = useDropInClient()
+  const client = useDropInClientOrNull()
   const [notifications, setNotifications] = useState<Notification[]>([])
   const [unseen, setUnseen] = useState(0)
   const [unread, setUnread] = useState(0)
   const [next, setNext] = useState<string | null>(null)
-  const [isLoading, setLoading] = useState(true)
+  const [isLoading, setLoading] = useState(client !== null)
   const [error, setError] = useState<Error | null>(null)
 
   // Lifetime of this hook's reads — aborted on unmount, so a poll or a page-2 fetch in
@@ -660,6 +703,7 @@ export function useNotifications(opts?: {
   const readSignal = () => readCtrl.current?.signal
 
   const load = useCallback(async (signal?: AbortSignal) => {
+    if (client === null) return // disabled provider — inert, zero network
     setLoading(true)
     setError(null)
     try {
@@ -680,6 +724,7 @@ export function useNotifications(opts?: {
   // Same signal-consumption discipline as useFeed's live mode (spec 2026-07-31-live-updates).
   const lastHeadRef = useRef<string | null>(null)
   const headTick = useCallback(async () => {
+    if (client === null) return
     try {
       const { latest } = await client.notifications.head({ signal: readSignal() })
       if (latest === null || latest === lastHeadRef.current) return
@@ -697,7 +742,7 @@ export function useNotifications(opts?: {
   }, [load])
 
   const loadNext = useCallback(async () => {
-    if (next === null) return
+    if (client === null || next === null) return
     const signal = readSignal()
     setLoading(true)
     try {
@@ -712,6 +757,7 @@ export function useNotifications(opts?: {
   }, [client, next])
 
   const markSeen = useCallback(async (ids?: string[]) => {
+    if (client === null) return // disabled — no optimistic write, no network
     const prev = { notifications, unseen }
     // An empty (or absent) id list means "mark all" — matching client.notifications.markSeen.
     const all = !ids?.length
@@ -729,6 +775,7 @@ export function useNotifications(opts?: {
   }, [client, notifications, unseen])
 
   const markRead = useCallback(async (ids?: string[]) => {
+    if (client === null) return // disabled — no optimistic write, no network
     const prev = { notifications, unread }
     // An empty (or absent) id list means "mark all" — matching client.notifications.markRead.
     const all = !ids?.length
@@ -754,32 +801,37 @@ export function useNotifications(opts?: {
 
   return {
     notifications, unseen, unread, loadNext, hasNext: next !== null,
-    isLoading, error, markSeen, markRead, refresh,
+    isLoading, error, markSeen, markRead, refresh, enabled: client !== null,
   }
 }
 
+/** Write-only feed actions. Inside a disabled provider both functions are no-ops
+ *  resolving `undefined` (never rejecting) and `enabled` is false. */
 export function useFeedActions<TCustom = Record<string, unknown>>(group: string, id: string) {
-  const client = useDropInClient()
+  const client = useDropInClientOrNull()
   const addActivity = useCallback(
-    (a: { verb: string; object: string; custom?: TCustom }) =>
-      client.feed(group, id).addActivity<TCustom>(a),
+    async (a: { verb: string; object: string; custom?: TCustom }) =>
+      client === null ? undefined : client.feed(group, id).addActivity<TCustom>(a),
     [client, group, id],
   )
   const deleteActivity = useCallback(
-    (activityId: string) => client.feed(group, id).removeActivity(activityId),
+    async (activityId: string) =>
+      client === null ? undefined : client.feed(group, id).removeActivity(activityId),
     [client, group, id],
   )
-  return { addActivity, deleteActivity }
+  return { addActivity, deleteActivity, enabled: client !== null }
 }
 
-/** The caller identified by the current token — wraps `client.users.me()`. */
+/** The caller identified by the current token — wraps `client.users.me()`.
+ *  Inert (`user: null`, no network, `enabled: false`) inside a disabled provider. */
 export function useCurrentUser() {
-  const client = useDropInClient()
+  const client = useDropInClientOrNull()
   const [user, setUser] = useState<{ id: string; custom: Record<string, unknown> } | null>(null)
-  const [isLoading, setLoading] = useState(true)
+  const [isLoading, setLoading] = useState(client !== null)
   const [error, setError] = useState<Error | null>(null)
 
   const load = useCallback(async (signal?: AbortSignal) => {
+    if (client === null) return // disabled provider — inert, zero network
     setLoading(true)
     setError(null)
     try {
@@ -799,5 +851,5 @@ export function useCurrentUser() {
     return () => ctrl.abort()
   }, [load])
 
-  return { user, isLoading, error, refresh }
+  return { user, isLoading, error, refresh, enabled: client !== null }
 }

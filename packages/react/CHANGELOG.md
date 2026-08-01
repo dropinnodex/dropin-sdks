@@ -1,5 +1,24 @@
 # @dropinnodex/react
 
+## 0.3.0
+
+### Minor Changes
+
+- 7af804c: Customer-zero DX round: server SDK requests now default to a 10s timeout
+  (`timeoutMs` option; a caller-supplied `signal` replaces it), and
+  `feed().addActivity<TCustom>()`/`get<TCustom>()` gain the client's custom-data
+  generics. React: `<DropInProvider enabled={false}>` puts every hook into an
+  inert no-network mode (`enabled: false` on hook returns,
+  `useDropInEnabled()`) so apps with optional feed config never crash in
+  environments without keys.
+
+  Type-level note: `useFeedActions().addActivity/deleteActivity` (and
+  `useFeed().addActivity`) now resolve `T | undefined` — `undefined` only in
+  disabled mode. Narrow with `if (result)` or gate on `useDropInEnabled()`.
+  Server `addActivity` input is now the typed activity shape (was
+  `Record<string, unknown>`) — arbitrary extra top-level keys become compile
+  errors; move free-form data under `custom`.
+
 ## 0.2.0
 
 ### Minor Changes
