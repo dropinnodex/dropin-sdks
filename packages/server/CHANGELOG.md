@@ -1,5 +1,17 @@
 # @dropinnodex/server
 
+## 0.3.0
+
+### Minor Changes
+
+- 78db1d9: Batch import API: `server.batch.users/follows/activities` — cold-start
+  migration of existing users, follow graphs, and historical activities.
+  `batch.userFollows([{ follower, following }])` covers the common
+  user-follows-user case with plain ids, expanding the `timeline:` → `user:`
+  feed convention for you.
+  Server-token only, ≤100 items per call, per-item results, idempotent, and
+  quiet (no notifications, live pings, or webhooks for imported history).
+
 ## 0.2.0
 
 ### Minor Changes

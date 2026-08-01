@@ -32,6 +32,20 @@ export interface WebhookDestination {
   [key: string]: unknown
 }
 
+/**
+ * The outcome of one item in a batch import. `index` is the item's position in the
+ * request array; on failure `code` is the stable error code (e.g. "INVALID_ARGUMENT"),
+ * never a message — collect the failed indexes and retry just those.
+ */
+export type BatchResultItem =
+  | { index: number; ok: true; id?: string }
+  | { index: number; ok: false; code: string }
+
+/** Per-item results of a batch import call. Partial failure is still a 200 — check each item. */
+export interface BatchResponse {
+  results: BatchResultItem[]
+}
+
 const MAX_TTL_SECONDS = 86_400
 
 /** The hosted API. Overridden via `url` for staging, a proxy, or local development. */
@@ -152,6 +166,29 @@ export class DropInServer {
     list: (opts: RequestOptions = {}) => this.call<WebhookDestination[]>('GET', '/v1/webhooks', undefined, opts),
     remove: (id: string, opts: RequestOptions = {}) =>
       this.call<void>('DELETE', `/v1/webhooks/${encodeURIComponent(id)}`, undefined, opts),
+  }
+
+  /** Cold-start import (server-token only, ≤100 items/call, quiet — no notifications,
+   *  live pings, or webhooks fire for imported history; see the "Migrating existing
+   *  data" guide). Per-item results: partial failure is still a 200, so check each
+   *  `results[i].ok`. Rerunning a batch is safe when activities carry `foreign_id` +
+   *  `time`. */
+  readonly batch = {
+    users: (users: Array<{ id: string; custom?: Record<string, unknown> }>, opts: RequestOptions = {}) =>
+      this.call<BatchResponse>('POST', '/v1/batch/users', { users }, opts),
+    follows: (follows: Array<{ source: string; target: string }>, opts: RequestOptions = {}) =>
+      this.call<BatchResponse>('POST', '/v1/batch/follows', { follows }, opts),
+    /** The 95% case, without feed-ref plumbing: "alice follows bob" expands to
+     *  `{ source: 'timeline:alice', target: 'user:bob' }` — alice's home feed pulls
+     *  from bob's wall. Use `follows` directly for non-user feed graphs. */
+    userFollows: (pairs: Array<{ follower: string; following: string }>, opts: RequestOptions = {}) =>
+      this.call<BatchResponse>('POST', '/v1/batch/follows', {
+        follows: pairs.map((p) => ({ source: `timeline:${p.follower}`, target: `user:${p.following}` })),
+      }, opts),
+    activities: (
+      activities: Array<{ feed: string; activity: Record<string, unknown> }>,
+      opts: RequestOptions = {},
+    ) => this.call<BatchResponse>('POST', '/v1/batch/activities', { activities }, opts),
   }
 
   /** Admin reaction ops (server token deletes any user's reaction). */

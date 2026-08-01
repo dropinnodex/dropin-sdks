@@ -192,6 +192,68 @@ describe('DropInServer.webhooks', () => {
   })
 })
 
+describe('DropInServer.batch', () => {
+  it('users POSTs /v1/batch/users with the envelope body and returns parsed results', async () => {
+    const results = [{ index: 0, ok: true, id: 'alice' }, { index: 1, ok: false, code: 'INVALID_ARGUMENT' }]
+    const fn = mockFetchOnce({ status: 200, json: { results } })
+    const res = await dropin.batch.users([{ id: 'alice' }, { id: '' }])
+    const [url, opts] = lastCall(fn)
+    expect(url).toBe('http://localhost:3000/v1/batch/users')
+    expect(opts.method).toBe('POST')
+    expect(opts.headers.authorization).toMatch(/^Bearer /)
+    expect(opts.headers['x-api-key']).toBe('dk_test')
+    expect(JSON.parse(opts.body!)).toEqual({ users: [{ id: 'alice' }, { id: '' }] })
+    expect(res).toEqual({ results })
+  })
+
+  it('follows POSTs /v1/batch/follows with the envelope body and returns parsed results', async () => {
+    const results = [{ index: 0, ok: true }]
+    const fn = mockFetchOnce({ status: 200, json: { results } })
+    const res = await dropin.batch.follows([{ source: 'timeline:alice', target: 'user:bob' }])
+    const [url, opts] = lastCall(fn)
+    expect(url).toBe('http://localhost:3000/v1/batch/follows')
+    expect(opts.method).toBe('POST')
+    expect(JSON.parse(opts.body!)).toEqual({ follows: [{ source: 'timeline:alice', target: 'user:bob' }] })
+    expect(res).toEqual({ results })
+  })
+
+  it('userFollows expands plain user ids into the timeline:→user: convention', async () => {
+    const results = [{ index: 0, ok: true }, { index: 1, ok: true }]
+    const fn = mockFetchOnce({ status: 200, json: { results } })
+    const res = await dropin.batch.userFollows([
+      { follower: 'alice', following: 'bob' },
+      { follower: 'carol', following: 'bob' },
+    ])
+    const [url, opts] = lastCall(fn)
+    expect(url).toBe('http://localhost:3000/v1/batch/follows')
+    expect(opts.method).toBe('POST')
+    expect(JSON.parse(opts.body!)).toEqual({
+      follows: [
+        { source: 'timeline:alice', target: 'user:bob' },
+        { source: 'timeline:carol', target: 'user:bob' },
+      ],
+    })
+    expect(res).toEqual({ results })
+  })
+
+  it('activities POSTs /v1/batch/activities with the envelope body and returns parsed results', async () => {
+    const results = [{ index: 0, ok: true, id: 'a1' }]
+    const fn = mockFetchOnce({ status: 200, json: { results } })
+    const res = await dropin.batch.activities([
+      { feed: 'user:alice', activity: { verb: 'post', object: 'game:1', foreign_id: 'g:1', time: '2024-01-01T00:00:00Z' } },
+    ])
+    const [url, opts] = lastCall(fn)
+    expect(url).toBe('http://localhost:3000/v1/batch/activities')
+    expect(opts.method).toBe('POST')
+    expect(JSON.parse(opts.body!)).toEqual({
+      activities: [
+        { feed: 'user:alice', activity: { verb: 'post', object: 'game:1', foreign_id: 'g:1', time: '2024-01-01T00:00:00Z' } },
+      ],
+    })
+    expect(res).toEqual({ results })
+  })
+})
+
 describe('DropInServer.reactions', () => {
   it('delete DELETEs /v1/reactions/:reactionId with a server token', async () => {
     const fn = mockFetchOnce({ ok: true, status: 204 })
