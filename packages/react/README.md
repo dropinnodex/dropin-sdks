@@ -1,8 +1,9 @@
 # @dropinnodex/react
 
 React hooks for [dropin-activity](https://github.com/) — a GetStream-shaped activity feed
-as a service. Feeds, reactions, follows, and notifications with **optimistic updates and
-rollback**.
+as a service. Feeds, reactions, follows, and notifications with **optimistic updates,
+rollback, and a rejection that fires after rollback so callers can react to network
+failures** (see [Optimistic writes reject after rollback](#optimistic-writes-reject-after-rollback)).
 
 ```bash
 npm i @dropinnodex/react @dropinnodex/client react
@@ -46,7 +47,7 @@ function Post({ activity }) {
   // (that's the GetStream-parity delete-by-id primitive, for when you already hold a
   // reaction's id from add()/list() — see @dropinnodex/client's README).
   return (
-    <button onClick={() => (liked ? unreact('like') : react('like'))}>
+    <button onClick={() => { void (liked ? unreact('like') : react('like')) }}>
       👍 {counts.like ?? 0}
     </button>
   )
@@ -246,7 +247,9 @@ const { activities, newCount, showNew } = useTimeline(uid, { pollInterval: 15000
 when someone follows them or reacts to their post — and keeps `unseen`/`unread` counts.
 `markSeen`/`markRead` are **optimistic with rollback**, the same discipline as
 `useReactions`: they update the local counter and stamp the rows before the request
-resolves, reverting if it fails, and self-correcting on the next refresh.
+resolves, reverting if it fails, and self-correcting on the next refresh. **The returned
+promise rejects after the rollback** — see [Optimistic writes reject after
+rollback](#optimistic-writes-reject-after-rollback) below.
 
 Keep notifications fresh with **`live: true`** for cheap change checks every 5 seconds
 (paused when hidden):
@@ -288,6 +291,77 @@ markRead, refresh }`.
 - Counts are server-authoritative; the optimistic decrement is a display
   convenience that reconciles to the server on the next `refresh`.
 - With `live: true`, no need to set `pollInterval`; `live` takes precedence if both are passed.
+
+## Optimistic writes reject after rollback
+
+Every action that updates local state optimistically — `react`, `unreact`, `remove` (reaction
+list), `follow`, `unfollow`, `markSeen`, `markRead` — applies the local change **first**, calls
+the network, and on rejection **rolls back the state AND rejects the returned promise**. The
+rollback and the rejection are independent signals: the rollback restores the UI to truth,
+the rejection lets you show a toast, log, or retry.
+
+This means **a fire-and-forget caller must handle the rejection** — otherwise the host app
+sees an unhandled promise rejection. The simplest patterns:
+
+```tsx
+// Fire-and-forget on a button: silence the rejection explicitly.
+<button onClick={() => { void react('like').catch(() => {}) }}>👍</button>
+
+// Or await in an async handler and branch on success.
+<button onClick={async () => {
+  try { await markSeen() } catch { /* UI already rolled back */ }
+}}>🔔</button>
+```
+
+We surfaced this contract live, not in tests: during customer integration (FC Urban, Aug
+2026), the upstream notifications endpoint started 500'ing tenant-wide, their bell's
+`onClick={() => markSeen()}` had no catch, and the unhandled rejection bubbled to their
+React error boundary — page crash. The local bell UI had already rolled back, so the data
+state was fine; only the missing `.catch()` was missing.
+
+Why the rejection is part of the contract (and not auto-swallowed): the same
+"rejection-after-rollback" shape applies to `react` / `unreact` and `follow` / `unfollow`,
+where callers often DO want to surface a failure (toast: "Couldn't save your like —
+retry?"). The notification bell is the unusual case where the failure is rarely worth
+the user's attention; for it, the `.catch(() => {})` is one extra line — or you can
+opt out of the rejection entirely with an `onError` sink (next section).
+
+### Opt-in error handling
+
+If you don't want the post-rollback rejection at all — typically because the failure isn't
+worth the user's attention (a notification bell, a fire-and-forget like button) — pass an
+`onError` sink. The hook then **rolls back and resolves to `undefined`** instead of
+rejecting:
+
+```tsx
+// Per-call: silence just this one write.
+const { markSeen } = useNotifications()
+<button onClick={() => { void markSeen(['n1'], { onError: (err) => console.warn(err) }) }}>
+  Mark seen
+</button>
+
+// Per-tree: every optimistic write inside this provider swallows via Sentry.
+<DropInProvider client={client} onError={(err, ctx) =>
+  Sentry.captureException(err, { extra: ctx })}>
+  <App />
+</DropInProvider>
+```
+
+The per-call `onError` (when present) overrides the provider-level one. With neither set,
+behavior is unchanged: the SDK still rejects after rollback — useful for `react` /
+`unreact` / `follow` / `unfollow` where you DO want to surface a toast or retry prompt.
+
+The `ctx` argument is action-specific so you can route without parsing strings:
+
+| Action | `ctx` shape |
+|---|---|
+| `useReactions.react` / `unreact` | `{ hook, action, activityId, kind }` |
+| `useReactionList.remove` | `{ hook, action, activityId, reactionId }` |
+| `useFollow.follow` / `unfollow` | `{ hook, action, source: {group, id}, target: {group, id} }` |
+| `useNotifications.markSeen` / `markRead` | `{ hook, action, ids: string[] \| null }` (`null` = mark-all) |
+
+Disabled-mode (`<DropInProvider enabled={false}>`) actions resolve to `undefined` and do
+NOT invoke `onError` — there is no error to observe.
 
 ## Cancellation on unmount
 

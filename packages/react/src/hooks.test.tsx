@@ -1047,3 +1047,255 @@ describe('cancellation on unmount', () => {
     expect(seen.every((s) => s!.aborted)).toBe(true)
   })
 })
+
+describe('optimistic-write onError plumbing', () => {
+  it('threads provider-level onError into useReactions.react on rejection', async () => {
+    const onError = vi.fn()
+    const reactions = {
+      add: vi.fn(async () => { throw new Error('boom') }),
+      delete: vi.fn(async () => undefined),
+      unreact: vi.fn(async () => undefined),
+    }
+    const client = makeClient({ reactions })
+    const wrap = ({ children }: { children: React.ReactNode }) => (
+      <DropInProvider client={client as never} onError={onError}>{children}</DropInProvider>
+    )
+    const { result } = renderHook(() => useReactions('a1'), { wrapper: wrap })
+    await act(async () => {
+      // Should resolve (not reject) when provider-level onError is set.
+      await result.current.react('like')
+    })
+    expect(onError).toHaveBeenCalledTimes(1)
+    expect(onError.mock.calls[0]![0]).toBeInstanceOf(Error)
+    expect(onError.mock.calls[0]![0].message).toBe('boom')
+    expect(onError.mock.calls[0]![1]).toMatchObject({
+      hook: 'useReactions', action: 'react', activityId: 'a1', kind: 'like',
+    })
+  })
+
+  it('useReactions.react with no onError still rejects after rollback (default contract)', async () => {
+    const reactions = {
+      add: vi.fn(async () => { throw new Error('boom') }),
+      delete: vi.fn(async () => undefined),
+      unreact: vi.fn(async () => undefined),
+    }
+    const client = makeClient({ reactions })
+    const { result } = renderHook(() => useReactions('a1'), { wrapper: wrapper(client) })
+    await act(async () => {
+      await expect(result.current.react('like')).rejects.toThrow('boom')
+    })
+    expect(result.current.counts.like ?? 0).toBe(0) // rolled back
+  })
+
+  it('useReactions.react with call-level onError resolves and invokes callback with rich ctx', async () => {
+    const onError = vi.fn()
+    const reactions = {
+      add: vi.fn(async () => { throw new Error('boom') }),
+      delete: vi.fn(async () => undefined),
+      unreact: vi.fn(async () => undefined),
+    }
+    const client = makeClient({ reactions })
+    const { result } = renderHook(() => useReactions('a1'), { wrapper: wrapper(client) })
+    await act(async () => {
+      // Resolves (not rejects) and rolls back counts.
+      await result.current.react('like', { onError })
+    })
+    expect(onError).toHaveBeenCalledTimes(1)
+    expect(onError.mock.calls[0]![1]).toMatchObject({
+      hook: 'useReactions', action: 'react', activityId: 'a1', kind: 'like',
+    })
+    expect(result.current.counts.like ?? 0).toBe(0) // rolled back
+    expect(result.current.ownReactions).not.toContain('like') // rolled back
+  })
+
+  it('useReactions.unreact with onError resolves and invokes callback', async () => {
+    const onError = vi.fn()
+    const reactions = {
+      add: vi.fn(async () => undefined),
+      delete: vi.fn(async () => undefined),
+      unreact: vi.fn(async () => { throw new Error('boom') }),
+    }
+    const client = makeClient({ reactions })
+    const { result } = renderHook(() => useReactions('a1', { like: 3 }, ['like']),
+      { wrapper: wrapper(client) })
+    await act(async () => {
+      await result.current.unreact('like', { onError })
+    })
+    expect(onError).toHaveBeenCalledTimes(1)
+    expect(onError.mock.calls[0]![1]).toMatchObject({
+      hook: 'useReactions', action: 'unreact', activityId: 'a1', kind: 'like',
+    })
+    expect(result.current.counts.like).toBe(3) // rolled back
+    expect(result.current.ownReactions).toContain('like') // rolled back
+  })
+
+  it('call-level onError overrides provider-level onError on useReactions', async () => {
+    const providerOnError = vi.fn()
+    const callOnError = vi.fn()
+    const reactions = {
+      add: vi.fn(async () => { throw new Error('boom') }),
+      delete: vi.fn(async () => undefined),
+      unreact: vi.fn(async () => undefined),
+    }
+    const client = makeClient({ reactions })
+    const wrap = ({ children }: { children: React.ReactNode }) => (
+      <DropInProvider client={client as never} onError={providerOnError}>{children}</DropInProvider>
+    )
+    const { result } = renderHook(() => useReactions('a1'), { wrapper: wrap })
+    await act(async () => {
+      await result.current.react('like', { onError: callOnError })
+    })
+    expect(providerOnError).not.toHaveBeenCalled()
+    expect(callOnError).toHaveBeenCalledTimes(1)
+  })
+
+  it('useReactionList.remove with onError resolves and invokes callback', async () => {
+    const onError = vi.fn()
+    const reactions = {
+      add: vi.fn(async () => undefined),
+      delete: vi.fn(async () => { throw new Error('boom') }),
+      unreact: vi.fn(async () => undefined),
+    }
+    const client = makeClient({ reactions })
+    const { result } = renderHook(() => useReactionList('a1'), { wrapper: wrapper(client) })
+    await act(async () => {
+      await result.current.remove('r1', { onError })
+    })
+    expect(onError).toHaveBeenCalledTimes(1)
+    expect(onError.mock.calls[0]![1]).toMatchObject({
+      hook: 'useReactionList', action: 'remove', activityId: 'a1', reactionId: 'r1',
+    })
+  })
+
+  it('useReactionList.remove with no onError still rejects after rollback (default contract)', async () => {
+    const reactions = {
+      add: vi.fn(async () => undefined),
+      delete: vi.fn(async () => { throw new Error('boom') }),
+      unreact: vi.fn(async () => undefined),
+    }
+    const client = makeClient({ reactions })
+    const { result } = renderHook(() => useReactionList('a1'), { wrapper: wrapper(client) })
+    await act(async () => {
+      await expect(result.current.remove('r1')).rejects.toThrow('boom')
+    })
+  })
+
+  it('useFollow.follow with onError resolves and invokes callback with source/target ctx', async () => {
+    const onError = vi.fn()
+    const feed = vi.fn(() => ({
+      get: vi.fn(async () => ({ results: [], next: null })),
+      follow: vi.fn(async () => { throw new Error('boom') }),
+      unfollow: vi.fn(async () => undefined),
+      following: vi.fn(async () => ({ results: [], next: null })),
+      addActivity: vi.fn(async () => undefined),
+      removeActivity: vi.fn(async () => undefined),
+      suggestions: vi.fn(async () => ({ results: [] })),
+      head: vi.fn(async () => ({ latest: null })),
+    }))
+    const client = makeClient({ feed })
+    const { result } = renderHook(() => useFollow('user', 'me'), { wrapper: wrapper(client) })
+    await waitFor(() => expect(result.current.isFollowing('user', 'them')).toBe(false))
+    await act(async () => {
+      await result.current.follow('user', 'them', { onError })
+    })
+    expect(onError).toHaveBeenCalledTimes(1)
+    expect(onError.mock.calls[0]![1]).toMatchObject({
+      hook: 'useFollow', action: 'follow',
+      source: { group: 'user', id: 'me' },
+      target: { group: 'user', id: 'them' },
+    })
+    expect(result.current.isFollowing('user', 'them')).toBe(false) // rolled back
+  })
+
+  it('useFollow.unfollow with onError resolves and invokes callback', async () => {
+    const onError = vi.fn()
+    const feed = vi.fn(() => ({
+      get: vi.fn(async () => ({ results: [], next: null })),
+      follow: vi.fn(async () => undefined),
+      unfollow: vi.fn(async () => { throw new Error('boom') }),
+      following: vi.fn(async () => ({ results: [], next: null })),
+      addActivity: vi.fn(async () => undefined),
+      removeActivity: vi.fn(async () => undefined),
+      suggestions: vi.fn(async () => ({ results: [] })),
+      head: vi.fn(async () => ({ latest: null })),
+    }))
+    const client = makeClient({ feed })
+    const { result } = renderHook(() => useFollow('user', 'me'), { wrapper: wrapper(client) })
+    await waitFor(() => expect(result.current.isFollowing('user', 'them')).toBe(false))
+    // Pre-seed the edge so unfollow has something to remove.
+    await act(async () => { await result.current.follow('user', 'them') })
+    await act(async () => { await result.current.unfollow('user', 'them', { onError }) })
+    expect(onError).toHaveBeenCalledTimes(1)
+    expect(onError.mock.calls[0]![1]).toMatchObject({
+      hook: 'useFollow', action: 'unfollow',
+      source: { group: 'user', id: 'me' },
+      target: { group: 'user', id: 'them' },
+    })
+  })
+
+  it('useNotifications.markSeen with onError resolves and invokes callback with ids ctx', async () => {
+    const onError = vi.fn()
+    const notifications = {
+      get: vi.fn(async () => ({ results: [], unseen: 0, unread: 0, next: null })),
+      markSeen: vi.fn(async () => { throw new Error('boom') }),
+      markRead: vi.fn(async () => undefined),
+    }
+    const client = makeClient({ notifications })
+    const { result } = renderHook(() => useNotifications(), { wrapper: wrapper(client) })
+    await act(async () => {
+      await result.current.markSeen(['n1'], { onError })
+    })
+    expect(onError).toHaveBeenCalledTimes(1)
+    expect(onError.mock.calls[0]![1]).toMatchObject({
+      hook: 'useNotifications', action: 'markSeen', ids: ['n1'],
+    })
+  })
+
+  it('useNotifications.markSeen with no ids and onError passes ids=null in ctx', async () => {
+    const onError = vi.fn()
+    const notifications = {
+      get: vi.fn(async () => ({ results: [], unseen: 0, unread: 0, next: null })),
+      markSeen: vi.fn(async () => { throw new Error('boom') }),
+      markRead: vi.fn(async () => undefined),
+    }
+    const client = makeClient({ notifications })
+    const { result } = renderHook(() => useNotifications(), { wrapper: wrapper(client) })
+    await act(async () => {
+      await result.current.markSeen(undefined, { onError })
+    })
+    expect(onError.mock.calls[0]![1]).toMatchObject({
+      hook: 'useNotifications', action: 'markSeen', ids: null,
+    })
+  })
+
+  it('useNotifications.markRead with onError resolves and invokes callback', async () => {
+    const onError = vi.fn()
+    const notifications = {
+      get: vi.fn(async () => ({ results: [], unseen: 0, unread: 0, next: null })),
+      markSeen: vi.fn(async () => undefined),
+      markRead: vi.fn(async () => { throw new Error('boom') }),
+    }
+    const client = makeClient({ notifications })
+    const { result } = renderHook(() => useNotifications(), { wrapper: wrapper(client) })
+    await act(async () => {
+      await result.current.markRead([], { onError })
+    })
+    expect(onError).toHaveBeenCalledTimes(1)
+    expect(onError.mock.calls[0]![1]).toMatchObject({
+      hook: 'useNotifications', action: 'markRead', ids: [],
+    })
+  })
+
+  it('useNotifications.markSeen with no onError still rejects after rollback (default contract)', async () => {
+    const notifications = {
+      get: vi.fn(async () => ({ results: [], unseen: 0, unread: 0, next: null })),
+      markSeen: vi.fn(async () => { throw new Error('boom') }),
+      markRead: vi.fn(async () => undefined),
+    }
+    const client = makeClient({ notifications })
+    const { result } = renderHook(() => useNotifications(), { wrapper: wrapper(client) })
+    await act(async () => {
+      await expect(result.current.markSeen(['n1'])).rejects.toThrow('boom')
+    })
+  })
+})

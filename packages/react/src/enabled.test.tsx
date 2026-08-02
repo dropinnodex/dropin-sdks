@@ -115,6 +115,23 @@ describe('DropInProvider enabled={false}', () => {
     expect(fetchSpy).not.toHaveBeenCalled()
   })
 
+  it('does not invoke onError when the provider is disabled (no error to observe)', async () => {
+    const onError = vi.fn()
+    const wrap = ({ children }: { children: React.ReactNode }) => (
+      <DropInProvider apiKey="k" url="http://api.example" tokenProvider={async () => 't'}
+                      enabled={false} onError={onError}>
+        {children}
+      </DropInProvider>
+    )
+    const { result } = renderHook(() => useNotifications(), { wrapper: wrap })
+    await act(async () => {
+      await expect(result.current.markSeen(['n1'], { onError })).resolves.toBeUndefined()
+      await expect(result.current.markRead()).resolves.toBeUndefined()
+    })
+    expect(onError).not.toHaveBeenCalled()
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
   it('useFollowStats returns its inert shape', async () => {
     const { result } = renderHook(() => useFollowStats('user', 'alice'), { wrapper: disabledWrapper })
     expect(Object.keys(result.current).sort()).toEqual([

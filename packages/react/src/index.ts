@@ -4,3 +4,4 @@ export {
   useFeedActivities, useFollowStats, useNotifications, useReactionList, useFollowers, useCurrentUser,
   useSuggestions,
 } from './hooks.js'
+export type { OptimisticOnError, OptimisticOnErrorCtx } from './hooks.js'

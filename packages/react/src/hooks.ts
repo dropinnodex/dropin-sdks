@@ -3,6 +3,30 @@ import type { Activity, Follow, Notification, Page, Reaction, Suggestion } from 
 import { useDropInContext, useDropInClientOrNull, type CacheEntry } from './provider.js'
 import { useLiveTicks } from './use-live.js'
 
+/** Action-specific context passed as the second arg of `OptimisticOnError`. */
+export type OptimisticOnErrorCtx =
+  | { hook: 'useReactions'; action: 'react' | 'unreact'; activityId: string; kind: string }
+  | { hook: 'useReactionList'; action: 'remove'; activityId: string; reactionId: string }
+  | { hook: 'useFollow'; action: 'follow' | 'unfollow';
+      source: { group: string; id: string }; target: { group: string; id: string } }
+  | { hook: 'useNotifications'; action: 'markSeen' | 'markRead'; ids: string[] | null }
+
+/** Opt-in error sink for an optimistic write. When provided (per-call or via
+ *  `<DropInProvider onError>`), the action rolls back AND resolves to `undefined` —
+ *  the rejection is replaced by this callback. Absence preserves the existing
+ *  reject-after-rollback contract. */
+export type OptimisticOnError = (err: Error, ctx: OptimisticOnErrorCtx) => void
+
+/** Internal helper: pick the per-call `opts.onError` if set, else fall back to the
+ *  provider-level one from context. Returns `undefined` when neither is set —
+ *  the action then falls through to its existing throw. */
+function resolveOnError(
+  call: { onError?: OptimisticOnError } | undefined,
+  provider: OptimisticOnError | undefined,
+): OptimisticOnError | undefined {
+  return call?.onError ?? provider
+}
+
 /**
  * Every hook cancels its READS when the component unmounts (or when the feed/activity it
  * is reading switches), by handing `@dropinnodex/client` an AbortSignal. WRITES are never
@@ -19,6 +43,15 @@ import { useLiveTicks } from './use-live.js'
  * RESOLVE to `undefined` (never reject — disabled mode exists precisely so the feed can
  * never break the host app's flow). Every hook return carries `enabled: boolean` as the
  * signal for apps that care; `useDropInEnabled()` is the standalone version.
+ *
+ * OPTIMISTIC WRITES REJECT AFTER ROLLBACK. Every action below — `react`, `unreact`,
+ * `remove` (reaction list), `follow`, `unfollow`, `markSeen`, `markRead` — updates local
+ * state immediately, calls the network, and on rejection **rolls back the state AND
+ * rejects the returned promise** so callers can show a toast, log, or retry. A
+ * fire-and-forget caller (e.g. an `onClick` on a notification bell) MUST wrap the call in
+ * `try/catch` or `.catch()` — an unhandled rejection here will surface as an unhandled
+ * promise rejection in the host app. Found live in customer validation (FC Urban) against
+ * a vendor-side notifications outage: their bell was uncaught and crashed the page.
  */
 function isAbort(err: unknown): boolean {
   return err instanceof Error && err.name === 'AbortError'
@@ -320,17 +353,21 @@ export function useUserFeed<TCustom = Record<string, unknown>>(
 export const useFeedActivities = useFeed
 
 /** Optimistic like/unlike counters. Inside a disabled provider, `react`/`unreact` are
- *  full no-ops resolving `undefined` (no optimistic bump either) and `enabled` is false. */
+ *  full no-ops resolving `undefined` (no optimistic bump either) and `enabled` is false.
+ *
+ *  `react(kind)` / `unreact(kind)` reject after rolling back — see the file header.
+ *  @throws The network error after the optimistic update has been rolled back. */
 export function useReactions(
   activityId: string,
   initialCounts: Record<string, number> = {},
   initialOwn: string[] = [],
 ) {
   const client = useDropInClientOrNull()
+  const ctx = useDropInContext()
   const [counts, setCounts] = useState(initialCounts)
   const [ownReactions, setOwn] = useState(initialOwn)
 
-  const react = useCallback(async (kind: string) => {
+  const react = useCallback(async (kind: string, opts?: { onError?: OptimisticOnError }) => {
     if (client === null) return // disabled — no optimistic write, no network
     const prevCounts = counts
     const prevOwn = ownReactions
@@ -342,11 +379,16 @@ export function useReactions(
     } catch (err) {
       setCounts(prevCounts)
       setOwn(prevOwn)
+      const handler = resolveOnError(opts, ctx.onError)
+      if (handler) {
+        handler(err as Error, { hook: 'useReactions', action: 'react', activityId, kind })
+        return
+      }
       throw err
     }
-  }, [client, activityId, counts, ownReactions])
+  }, [client, activityId, counts, ownReactions, ctx])
 
-  const unreact = useCallback(async (kind: string) => {
+  const unreact = useCallback(async (kind: string, opts?: { onError?: OptimisticOnError }) => {
     if (client === null) return // disabled — no optimistic write, no network
     const prevCounts = counts
     const prevOwn = ownReactions
@@ -358,9 +400,14 @@ export function useReactions(
     } catch (err) {
       setCounts(prevCounts)
       setOwn(prevOwn)
+      const handler = resolveOnError(opts, ctx.onError)
+      if (handler) {
+        handler(err as Error, { hook: 'useReactions', action: 'unreact', activityId, kind })
+        return
+      }
       throw err
     }
-  }, [client, activityId, counts, ownReactions])
+  }, [client, activityId, counts, ownReactions, ctx])
 
   return { react, unreact, counts, ownReactions, enabled: client !== null }
 }
@@ -370,9 +417,13 @@ export function useReactions(
  * `useReactions`, which is the optimistic like/unlike counter). Paginates via `loadNext`;
  * `remove(reactionId)` deletes a reaction by id with an optimistic drop + rollback.
  * Inert (empty list, no network, `enabled: false`) inside a disabled provider.
+ *
+ * `remove(reactionId)` rejects after rolling back — see the file header.
+ * @throws The network error after the optimistic drop has been rolled back.
  */
 export function useReactionList(activityId: string, opts?: { kind?: string }) {
   const client = useDropInClientOrNull()
+  const ctx = useDropInContext()
   const kind = opts?.kind
   const [reactions, setReactions] = useState<Reaction[]>([])
   const [next, setNext] = useState<string | null>(null)
@@ -426,7 +477,7 @@ export function useReactionList(activityId: string, opts?: { kind?: string }) {
     }
   }, [client, activityId, kind, next])
 
-  const remove = useCallback(async (reactionId: string) => {
+  const remove = useCallback(async (reactionId: string, opts?: { onError?: OptimisticOnError }) => {
     if (client === null) return // disabled — no optimistic drop, no network
     const prev = reactions
     setReactions((rs) => rs.filter((r) => r.id !== reactionId))
@@ -434,17 +485,27 @@ export function useReactionList(activityId: string, opts?: { kind?: string }) {
       await client.reactions.delete(reactionId)
     } catch (err) {
       setReactions(prev)
+      const handler = resolveOnError(opts, ctx.onError)
+      if (handler) {
+        handler(err as Error, { hook: 'useReactionList', action: 'remove', activityId, reactionId })
+        return
+      }
       throw err
     }
-  }, [client, reactions])
+  }, [client, activityId, reactions, ctx])
 
   return { reactions, loadNext, hasNext: next !== null, isLoading, error, remove, refresh, enabled: client !== null }
 }
 
 /** Optimistic follow/unfollow with server hydration. Inside a disabled provider,
- *  `follow`/`unfollow` no-op resolve `undefined`, nothing hydrates, `enabled` is false. */
+ *  `follow`/`unfollow` no-op resolve `undefined`, nothing hydrates, `enabled` is false.
+ *
+ *  `follow(targetGroup, targetId)` / `unfollow(targetGroup, targetId)` reject after
+ *  rolling back — see the file header.
+ *  @throws The network error after the optimistic edge toggle has been rolled back. */
 export function useFollow(group: string, id: string) {
   const client = useDropInClientOrNull()
+  const ctx = useDropInContext()
   const [edges, setEdges] = useState<Set<string>>(new Set())
   // Keys the user has optimistically follow()'d or unfollow()'d this session. Hydration
   // (below) must never override these with server state — see the effect's comment for why.
@@ -501,7 +562,7 @@ export function useFollow(group: string, id: string) {
 
   const isFollowing = useCallback((tGroup: string, tId: string) => edges.has(`${tGroup}:${tId}`), [edges])
 
-  const follow = useCallback(async (tGroup: string, tId: string) => {
+  const follow = useCallback(async (tGroup: string, tId: string, opts?: { onError?: OptimisticOnError }) => {
     if (client === null) return // disabled — no optimistic write, no network
     const key = `${tGroup}:${tId}`
     const prev = edges
@@ -511,11 +572,19 @@ export function useFollow(group: string, id: string) {
       await client.feed(group, id).follow(tGroup, tId)
     } catch (err) {
       setEdges(prev)
+      const handler = resolveOnError(opts, ctx.onError)
+      if (handler) {
+        handler(err as Error, {
+          hook: 'useFollow', action: 'follow',
+          source: { group, id }, target: { group: tGroup, id: tId },
+        })
+        return
+      }
       throw err
     }
-  }, [client, group, id, edges])
+  }, [client, group, id, edges, ctx])
 
-  const unfollow = useCallback(async (tGroup: string, tId: string) => {
+  const unfollow = useCallback(async (tGroup: string, tId: string, opts?: { onError?: OptimisticOnError }) => {
     if (client === null) return // disabled — no optimistic write, no network
     const key = `${tGroup}:${tId}`
     const prev = edges
@@ -525,9 +594,17 @@ export function useFollow(group: string, id: string) {
       await client.feed(group, id).unfollow(tGroup, tId)
     } catch (err) {
       setEdges(prev)
+      const handler = resolveOnError(opts, ctx.onError)
+      if (handler) {
+        handler(err as Error, {
+          hook: 'useFollow', action: 'unfollow',
+          source: { group, id }, target: { group: tGroup, id: tId },
+        })
+        return
+      }
       throw err
     }
-  }, [client, group, id, edges])
+  }, [client, group, id, edges, ctx])
 
   return { follow, unfollow, isFollowing, enabled: client !== null }
 }
@@ -682,6 +759,13 @@ export function useSuggestions(group: string, id: string, opts?: { limit?: numbe
  *
  * Inert inside a disabled provider: empty list, zero counts, `isLoading: false`,
  * `error: null`, `enabled: false`; `markSeen`/`markRead` no-op resolve `undefined`.
+ *
+ * `markSeen(ids?)` / `markRead(ids?)` reject after rolling back — see the file header.
+ * @throws The network error after the optimistic stamp has been rolled back. This is the
+ * footgun that crashed the FC Urban notification bell in live testing (Aug 2026) when the
+ * upstream notifications endpoint started 500'ing: an uncaught promise rejection in their
+ * `onClick` handler bubbled to the React error boundary. Always wrap in
+ * `try { await markSeen() } catch {}` (or `.catch(() => {})`) for fire-and-forget callers.
  */
 export function useNotifications(opts?: {
   /** @deprecated Use `live: true` — cheaper and visibility-aware. Ignored when `live` is set. */
@@ -690,6 +774,7 @@ export function useNotifications(opts?: {
   live?: boolean
 }) {
   const client = useDropInClientOrNull()
+  const ctx = useDropInContext()
   const [notifications, setNotifications] = useState<Notification[]>([])
   const [unseen, setUnseen] = useState(0)
   const [unread, setUnread] = useState(0)
@@ -756,7 +841,7 @@ export function useNotifications(opts?: {
     }
   }, [client, next])
 
-  const markSeen = useCallback(async (ids?: string[]) => {
+  const markSeen = useCallback(async (ids?: string[], opts?: { onError?: OptimisticOnError }) => {
     if (client === null) return // disabled — no optimistic write, no network
     const prev = { notifications, unseen }
     // An empty (or absent) id list means "mark all" — matching client.notifications.markSeen.
@@ -770,11 +855,18 @@ export function useNotifications(opts?: {
     } catch (err) {
       setNotifications(prev.notifications)
       setUnseen(prev.unseen)
+      const handler = resolveOnError(opts, ctx.onError)
+      if (handler) {
+        handler(err as Error, {
+          hook: 'useNotifications', action: 'markSeen', ids: ids ?? null,
+        })
+        return
+      }
       throw err
     }
-  }, [client, notifications, unseen])
+  }, [client, notifications, unseen, ctx])
 
-  const markRead = useCallback(async (ids?: string[]) => {
+  const markRead = useCallback(async (ids?: string[], opts?: { onError?: OptimisticOnError }) => {
     if (client === null) return // disabled — no optimistic write, no network
     const prev = { notifications, unread }
     // An empty (or absent) id list means "mark all" — matching client.notifications.markRead.
@@ -788,9 +880,16 @@ export function useNotifications(opts?: {
     } catch (err) {
       setNotifications(prev.notifications)
       setUnread(prev.unread)
+      const handler = resolveOnError(opts, ctx.onError)
+      if (handler) {
+        handler(err as Error, {
+          hook: 'useNotifications', action: 'markRead', ids: ids ?? null,
+        })
+        return
+      }
       throw err
     }
-  }, [client, notifications, unread])
+  }, [client, notifications, unread, ctx])
 
   useEffect(() => {
     if (opts?.live === true) return // live mode owns freshness; the deprecated timer never arms

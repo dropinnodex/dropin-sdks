@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useMemo, useRef } from 'react'
 import { DropInClient } from '@dropinnodex/client'
 import type { Activity } from '@dropinnodex/client'
+import type { OptimisticOnError } from './hooks.js'
 
 export interface CacheEntry {
   activities: Activity[]
@@ -11,17 +12,22 @@ interface ContextValue {
   /** `null` only inside a disabled provider (`enabled={false}`) — no client is ever built. */
   client: DropInClient | null
   cache: Map<string, CacheEntry>
+  /** Provider-level default error sink for optimistic writes. Per-call `opts.onError`
+   *  on each action overrides this. `undefined` preserves the default reject-after-
+   *  rollback contract. */
+  onError: OptimisticOnError | undefined
 }
 
 const Ctx = createContext<ContextValue | null>(null)
 
 type ProviderProps =
-  | { client: DropInClient; enabled?: boolean; children: React.ReactNode }
+  | { client: DropInClient; enabled?: boolean; onError?: OptimisticOnError; children: React.ReactNode }
   | {
       apiKey: string
       url: string
       tokenProvider: () => Promise<string>
       enabled?: boolean
+      onError?: OptimisticOnError
       children: React.ReactNode
     }
 
@@ -43,6 +49,10 @@ type ProviderProps =
  * provider at all still throws — disabled mode is an explicit choice, missing
  * configuration stays loud.
  *
+ * Both forms also accept an optional `onError` (typed `OptimisticOnError`) that every
+ * hook's optimistic action uses as the default error sink — see "Optimistic-write error
+ * handling" in the README.
+ *
  * Note: the client is memoized on apiKey/url — a `tokenProvider` that needs to change
  * identity (e.g. to mint for a different user) won't be picked up unless apiKey/url also
  * change or the provider is remounted. A tokenProvider that always mints for the current
@@ -51,6 +61,7 @@ type ProviderProps =
 export function DropInProvider(props: ProviderProps) {
   const { children } = props
   const enabled = props.enabled !== false
+  const onError = props.onError
   // The memo always runs (hooks must be unconditional); a supplied client wins.
   // When disabled it returns null WITHOUT constructing anything — that is the whole point.
   const client = useMemo(
@@ -67,7 +78,7 @@ export function DropInProvider(props: ProviderProps) {
   // A small cache keyed by feed. Deliberately not TanStack Query — this package stays
   // dependency-free apart from React itself.
   const cache = useRef(new Map<string, CacheEntry>())
-  const value = useMemo(() => ({ client, cache: cache.current }), [client])
+  const value = useMemo(() => ({ client, cache: cache.current, onError }), [client, onError])
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>
 }
 
