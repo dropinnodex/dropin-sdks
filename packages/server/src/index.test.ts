@@ -254,6 +254,57 @@ describe('DropInServer.batch', () => {
   })
 })
 
+describe('DropInServer follow writes — the loud path', () => {
+  it('feed().follow POSTs the follow route, which notifies (unlike batch)', async () => {
+    const fn = mockFetchOnce({ ok: true, status: 201 })
+    await dropin.feed('timeline', 'alice').follow('user', 'bob')
+    const [url, opts] = lastCall(fn)
+    expect(opts.method).toBe('POST')
+    expect(new URL(url).pathname).toBe('/v1/feeds/timeline/alice/follows')
+    expect(JSON.parse(opts.body!)).toEqual({ target: 'user:bob' })
+    expect(opts.headers.authorization).toMatch(/^Bearer /)
+  })
+
+  it('feed().unfollow DELETEs the target-scoped route', async () => {
+    const fn = mockFetchOnce({ ok: true, status: 204 })
+    await dropin.feed('timeline', 'alice').unfollow('user', 'bob')
+    const [url, opts] = lastCall(fn)
+    expect(opts.method).toBe('DELETE')
+    expect(new URL(url).pathname).toBe('/v1/feeds/timeline/alice/follows/user/bob')
+  })
+
+  it('unfollow encodes every path segment', async () => {
+    const fn = mockFetchOnce({ ok: true, status: 204 })
+    await dropin.feed('timeline', 'a/b').unfollow('user', 'c d')
+    const [url] = lastCall(fn)
+    expect(new URL(url).pathname).toBe('/v1/feeds/timeline/a%2Fb/follows/user/c%20d')
+  })
+
+  it('follow takes (group, id) like the client SDK, not a "group:id" ref', async () => {
+    const fn = mockFetchOnce({ ok: true, status: 201 })
+    await dropin.feed('timeline', 'alice').follow('user', 'bob')
+    const [, opts] = lastCall(fn)
+    expect(JSON.parse(opts.body!).target).toBe('user:bob')
+  })
+
+  it('userFollow expands plain ids the same way batch.userFollows does', async () => {
+    const fn = mockFetchOnce({ ok: true, status: 201 })
+    await dropin.userFollow({ follower: 'alice', following: 'bob' })
+    const [url, opts] = lastCall(fn)
+    expect(opts.method).toBe('POST')
+    expect(new URL(url).pathname).toBe('/v1/feeds/timeline/alice/follows')
+    expect(JSON.parse(opts.body!)).toEqual({ target: 'user:bob' })
+  })
+
+  it('userUnfollow mirrors userFollow', async () => {
+    const fn = mockFetchOnce({ ok: true, status: 204 })
+    await dropin.userUnfollow({ follower: 'alice', following: 'bob' })
+    const [url, opts] = lastCall(fn)
+    expect(opts.method).toBe('DELETE')
+    expect(new URL(url).pathname).toBe('/v1/feeds/timeline/alice/follows/user/bob')
+  })
+})
+
 describe('DropInServer.reactions', () => {
   it('delete DELETEs /v1/reactions/:reactionId with a server token', async () => {
     const fn = mockFetchOnce({ ok: true, status: 204 })

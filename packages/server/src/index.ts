@@ -181,17 +181,27 @@ export class DropInServer {
    *  `results[i].ok`. Rerunning a batch is safe when activities carry `foreign_id` +
    *  `time`. */
   readonly batch = {
+    /** QUIET: imported users are created without any side effect. */
     users: (users: Array<{ id: string; custom?: Record<string, unknown> }>, opts: RequestOptions = {}) =>
       this.call<BatchResponse>('POST', '/v1/batch/users', { users }, opts),
+    /** QUIET: the edges are created but the followed feeds get NO notification and no
+     *  `follow.added` webhook. For a follow that just happened in your app, use
+     *  {@link DropInServer.userFollow} / `feed().follow()` instead. */
     follows: (follows: Array<{ source: string; target: string }>, opts: RequestOptions = {}) =>
       this.call<BatchResponse>('POST', '/v1/batch/follows', { follows }, opts),
     /** The 95% case, without feed-ref plumbing: "alice follows bob" expands to
      *  `{ source: 'timeline:alice', target: 'user:bob' }` — alice's home feed pulls
-     *  from bob's wall. Use `follows` directly for non-user feed graphs. */
+     *  from bob's wall. Use `follows` directly for non-user feed graphs.
+     *
+     *  QUIET: bob is NOT notified that alice followed him, and no `follow.added` webhook
+     *  fires. That is right for backfilling an existing social graph and wrong for
+     *  mirroring a follow a user just made — use {@link DropInServer.userFollow} for that. */
     userFollows: (pairs: Array<{ follower: string; following: string }>, opts: RequestOptions = {}) =>
       this.call<BatchResponse>('POST', '/v1/batch/follows', {
         follows: pairs.map((p) => ({ source: `timeline:${p.follower}`, target: `user:${p.following}` })),
       }, opts),
+    /** QUIET: imported activities land in feeds but fire no notifications, live pings,
+     *  or `activity.added` webhooks. */
     activities: (
       activities: Array<{ feed: string; activity: Record<string, unknown> }>,
       opts: RequestOptions = {},
@@ -227,6 +237,33 @@ export class DropInServer {
       },
       followStats: (opts: RequestOptions = {}) =>
         this.call<FollowStats>('GET', `${base}/stats`, undefined, opts),
+      /** Create a follow edge, LOUD: a `user:` target gets a follow notification and a
+       *  `follow.added` webhook fires. This is the call for a follow that just happened in
+       *  your app — `batch.follows` is the quiet import path and notifies nobody.
+       *
+       *  Idempotent: re-following an existing edge writes nothing and notifies nobody, so
+       *  an at-least-once trigger can safely deliver twice. */
+      follow: (targetGroup: string, targetId: string, opts: RequestOptions = {}) =>
+        this.call<void>('POST', `${base}/follows`, { target: `${targetGroup}:${targetId}` }, opts),
+      /** Remove a follow edge. Same argument shape as `follow`. */
+      unfollow: (targetGroup: string, targetId: string, opts: RequestOptions = {}) =>
+        this.call<void>(
+          'DELETE',
+          `${base}/follows/${encodeURIComponent(targetGroup)}/${encodeURIComponent(targetId)}`,
+          undefined, opts,
+        ),
     }
+  }
+
+  /** "alice follows bob", LOUD — the notifying counterpart of `batch.userFollows`, for a
+   *  follow that just happened rather than one being imported. Expands to
+   *  `timeline:alice → user:bob`; bob is notified and `follow.added` fires. */
+  userFollow(pair: { follower: string; following: string }, opts: RequestOptions = {}): Promise<void> {
+    return this.feed('timeline', pair.follower).follow('user', pair.following, opts)
+  }
+
+  /** The inverse of {@link DropInServer.userFollow}. */
+  userUnfollow(pair: { follower: string; following: string }, opts: RequestOptions = {}): Promise<void> {
+    return this.feed('timeline', pair.follower).unfollow('user', pair.following, opts)
   }
 }

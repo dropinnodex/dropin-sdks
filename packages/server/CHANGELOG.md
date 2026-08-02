@@ -1,5 +1,21 @@
 # @dropinnodex/server
 
+## 0.5.0
+
+### Minor Changes
+
+- f3b1a34: Add server-side follow writes: `feed(group, id).follow(targetGroup, targetId)` /
+  `.unfollow(…)`, plus `userFollow({ follower, following })` / `userUnfollow(…)` sugar.
+
+  The follow route already accepted a server token and notified the followed user, but the
+  SDK exposed no method for it — the only reachable follow write was `batch.follows`, which
+  is quiet by design. Backends mirroring live follows were pushed to either the quiet import
+  path (no notification) or minting a user token as a workaround. Argument shape matches the
+  client SDK's `follow(group, id)`.
+
+  Also documents the quiet contract on each `batch.*` member's own jsdoc, so it shows on
+  hover for `batch.userFollows` rather than only on the `batch` object.
+
 ## 0.4.0
 
 ### Minor Changes
