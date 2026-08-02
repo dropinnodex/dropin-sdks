@@ -305,6 +305,98 @@ describe('DropInServer follow writes — the loud path', () => {
   })
 })
 
+describe('DropInServer reads — parity with the client SDK', () => {
+  it('feed().followers pages the followers route', async () => {
+    const fn = mockFetchOnce({ status: 200, json: { results: [], next: null } })
+    await dropin.feed('user', 'bob').followers({ limit: 50 })
+    const [url, opts] = lastCall(fn)
+    expect(opts.method).toBe('GET')
+    const u = new URL(url)
+    expect(u.pathname).toBe('/v1/feeds/user/bob/followers')
+    expect(u.searchParams.get('limit')).toBe('50')
+  })
+
+  it('feed().following pages the follows route and forwards the cursor', async () => {
+    const fn = mockFetchOnce({ status: 200, json: { results: [], next: null } })
+    await dropin.feed('timeline', 'alice').following({ next: 'CUR' })
+    const [url] = lastCall(fn)
+    const u = new URL(url)
+    expect(u.pathname).toBe('/v1/feeds/timeline/alice/follows')
+    expect(u.searchParams.get('next')).toBe('CUR')
+  })
+
+  it('feed().suggestions takes a limit and no cursor', async () => {
+    const fn = mockFetchOnce({ status: 200, json: { results: [] } })
+    await dropin.feed('timeline', 'alice').suggestions({ limit: 5 })
+    const [url] = lastCall(fn)
+    const u = new URL(url)
+    expect(u.pathname).toBe('/v1/feeds/timeline/alice/suggestions')
+    expect(u.searchParams.get('limit')).toBe('5')
+  })
+
+  it('feed().removeActivity DELETEs the activity route, not a feed-scoped one', async () => {
+    const fn = mockFetchOnce({ ok: true, status: 204 })
+    await dropin.feed('user', 'bob').removeActivity('ACT-1')
+    const [url, opts] = lastCall(fn)
+    expect(opts.method).toBe('DELETE')
+    expect(new URL(url).pathname).toBe('/v1/activities/ACT-1')
+  })
+
+  it('reactions.list pages one activity and filters by kind', async () => {
+    const fn = mockFetchOnce({ status: 200, json: { results: [], next: null } })
+    await dropin.reactions.list('ACT-1', { kind: 'like', limit: 10 })
+    const [url, opts] = lastCall(fn)
+    expect(opts.method).toBe('GET')
+    const u = new URL(url)
+    expect(u.pathname).toBe('/v1/activities/ACT-1/reactions')
+    expect(u.searchParams.get('kind')).toBe('like')
+    expect(u.searchParams.get('limit')).toBe('10')
+  })
+})
+
+describe('DropInServer.notifications — server tokens act for a named owner', () => {
+  it('list sends owner as a query param', async () => {
+    const fn = mockFetchOnce({ status: 200, json: { results: [], unseen: 0, unread: 0, next: null } })
+    await dropin.notifications.list({ owner: 'bob', limit: 20 })
+    const [url, opts] = lastCall(fn)
+    expect(opts.method).toBe('GET')
+    const u = new URL(url)
+    expect(u.pathname).toBe('/v1/notifications')
+    expect(u.searchParams.get('owner')).toBe('bob')
+    expect(u.searchParams.get('limit')).toBe('20')
+  })
+
+  it('markSeen with ids sends them alongside the owner', async () => {
+    const fn = mockFetchOnce({ ok: true, status: 204 })
+    await dropin.notifications.markSeen({ owner: 'bob', ids: ['N1', 'N2'] })
+    const [url, opts] = lastCall(fn)
+    expect(opts.method).toBe('POST')
+    expect(new URL(url).pathname).toBe('/v1/notifications/mark')
+    expect(JSON.parse(opts.body!)).toEqual({ owner: 'bob', seen: ['N1', 'N2'] })
+  })
+
+  it('markSeen without ids means ALL — seen: true, matching the client SDK', async () => {
+    const fn = mockFetchOnce({ ok: true, status: 204 })
+    await dropin.notifications.markSeen({ owner: 'bob' })
+    const [, opts] = lastCall(fn)
+    expect(JSON.parse(opts.body!)).toEqual({ owner: 'bob', seen: true })
+  })
+
+  it('an empty ids array also means ALL, never an empty mark the API would reject', async () => {
+    const fn = mockFetchOnce({ ok: true, status: 204 })
+    await dropin.notifications.markSeen({ owner: 'bob', ids: [] })
+    const [, opts] = lastCall(fn)
+    expect(JSON.parse(opts.body!)).toEqual({ owner: 'bob', seen: true })
+  })
+
+  it('markRead mirrors markSeen on the read field', async () => {
+    const fn = mockFetchOnce({ ok: true, status: 204 })
+    await dropin.notifications.markRead({ owner: 'bob', ids: ['N1'] })
+    const [, opts] = lastCall(fn)
+    expect(JSON.parse(opts.body!)).toEqual({ owner: 'bob', read: ['N1'] })
+  })
+})
+
 describe('DropInServer.reactions', () => {
   it('delete DELETEs /v1/reactions/:reactionId with a server token', async () => {
     const fn = mockFetchOnce({ ok: true, status: 204 })

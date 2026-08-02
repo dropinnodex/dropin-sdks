@@ -7,9 +7,12 @@ import * as jose from 'jose'
 // the dependency boundary — which forbids @dropinnodex/client and @dropinnodex/react depending on
 // @dropinnodex/server, not the reverse. This is what makes `feed().get()` return a typed
 // `Page<Activity<TCustom>>` instead of `unknown`, so SSR `initialData` flows typed end to end.
-import type { Activity, FollowStats, Page, RequestOptions } from '@dropinnodex/client'
+import type {
+  Activity, Follow, FollowStats, Notification, NotificationPage, Page, Reaction,
+  RequestOptions, Suggestion,
+} from '@dropinnodex/client'
 
-export type { RequestOptions }
+export type { RequestOptions, Follow, Notification, NotificationPage, Reaction, Suggestion }
 
 /**
  * A webhook destination. The delivery infrastructure owns storage and the full response
@@ -81,6 +84,17 @@ function parseDuration(spec: string): number {
   const n = Number(m[1])
   const unit = m[2] as 's' | 'm' | 'h' | 'd'
   return n * { s: 1, m: 60, h: 3600, d: 86_400 }[unit]
+}
+
+/** Build a query string, dropping undefined params. Returns "" when nothing is set, so it
+ *  is always safe to append to a path. */
+function qs(params: Record<string, string | number | undefined>): string {
+  const search = new URLSearchParams()
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined) search.set(k, String(v))
+  }
+  const s = search.toString()
+  return s ? `?${s}` : ''
 }
 
 type FetchFn = typeof fetch
@@ -208,10 +222,49 @@ export class DropInServer {
     ) => this.call<BatchResponse>('POST', '/v1/batch/activities', { activities }, opts),
   }
 
-  /** Admin reaction ops (server token deletes any user's reaction). */
+  /** Admin reaction ops (server token deletes any user's reaction). Adding a reaction is
+   *  deliberately absent: a reaction needs an acting user, and a server token has no
+   *  identity — mint a user token for that. */
   readonly reactions = {
     delete: (reactionId: string, opts: RequestOptions = {}) =>
       this.call<void>('DELETE', `/v1/reactions/${encodeURIComponent(reactionId)}`, undefined, opts),
+    /** A page of reactions on an activity, newest first. `kind` filters server-side. */
+    list: (
+      activityId: string,
+      q: { kind?: string; limit?: number; next?: string; /** @deprecated use `next` */ cursor?: string } = {},
+      opts: RequestOptions = {},
+    ) =>
+      this.call<Page<Reaction>>(
+        'GET',
+        `/v1/activities/${encodeURIComponent(activityId)}/reactions${qs({
+          kind: q.kind, limit: q.limit, next: q.next ?? q.cursor,
+        })}`,
+        undefined, opts,
+      ),
+  }
+
+  /** Read and mark a user's notifications from your backend — for sending push
+   *  notifications or emails, or building an admin view. A server token has no identity,
+   *  so every call names the `owner` it acts for; omitting it is `FORBIDDEN`, never a
+   *  cross-user leak. */
+  readonly notifications = {
+    list: (
+      q: { owner: string; limit?: number; next?: string; /** @deprecated use `next` */ cursor?: string },
+      opts: RequestOptions = {},
+    ) =>
+      this.call<NotificationPage>(
+        'GET',
+        `/v1/notifications${qs({ owner: q.owner, limit: q.limit, next: q.next ?? q.cursor })}`,
+        undefined, opts,
+      ),
+    /** Mark specific notifications seen, or ALL of the owner's when `ids` is omitted or empty. */
+    markSeen: (q: { owner: string; ids?: string[] }, opts: RequestOptions = {}) =>
+      this.call<void>('POST', '/v1/notifications/mark',
+        { owner: q.owner, seen: q.ids?.length ? q.ids : true }, opts),
+    /** Mark specific notifications read, or ALL of the owner's when `ids` is omitted or empty. */
+    markRead: (q: { owner: string; ids?: string[] }, opts: RequestOptions = {}) =>
+      this.call<void>('POST', '/v1/notifications/mark',
+        { owner: q.owner, read: q.ids?.length ? q.ids : true }, opts),
   }
 
   feed(group: string, id: string) {
@@ -227,14 +280,10 @@ export class DropInServer {
       get: <TCustom = Record<string, unknown>>(
         q: { limit?: number; next?: string; /** @deprecated use `next` */ cursor?: string } = {},
         opts: RequestOptions = {},
-      ) => {
-        const params = new URLSearchParams()
-        if (q.limit !== undefined) params.set('limit', String(q.limit))
-        const token = q.next ?? q.cursor
-        if (token !== undefined) params.set('next', token)
-        const qs = params.toString()
-        return this.call<Page<Activity<TCustom>>>('GET', qs ? `${base}?${qs}` : base, undefined, opts)
-      },
+      ) =>
+        this.call<Page<Activity<TCustom>>>(
+          'GET', `${base}${qs({ limit: q.limit, next: q.next ?? q.cursor })}`, undefined, opts,
+        ),
       followStats: (opts: RequestOptions = {}) =>
         this.call<FollowStats>('GET', `${base}/stats`, undefined, opts),
       /** Create a follow edge, LOUD: a `user:` target gets a follow notification and a
@@ -252,6 +301,33 @@ export class DropInServer {
           `${base}/follows/${encodeURIComponent(targetGroup)}/${encodeURIComponent(targetId)}`,
           undefined, opts,
         ),
+      /** Who follows this feed, newest edge first. */
+      followers: (
+        q: { limit?: number; next?: string; /** @deprecated use `next` */ cursor?: string } = {},
+        opts: RequestOptions = {},
+      ) =>
+        this.call<Page<Follow>>(
+          'GET', `${base}/followers${qs({ limit: q.limit, next: q.next ?? q.cursor })}`, undefined, opts,
+        ),
+      /** Who this feed follows, newest edge first. */
+      following: (
+        q: { limit?: number; next?: string; /** @deprecated use `next` */ cursor?: string } = {},
+        opts: RequestOptions = {},
+      ) =>
+        this.call<Page<Follow>>(
+          'GET', `${base}/follows${qs({ limit: q.limit, next: q.next ?? q.cursor })}`, undefined, opts,
+        ),
+      /** Who this feed should follow — friends-of-friends by mutual overlap, topped up by
+       *  popularity. A capped top-N, so there is no cursor. */
+      suggestions: (q: { limit?: number } = {}, opts: RequestOptions = {}) =>
+        this.call<{ results: Suggestion[] }>(
+          'GET', `${base}/suggestions${qs({ limit: q.limit })}`, undefined, opts,
+        ),
+      /** Soft-delete an activity. A server token may remove an activity from ANY feed —
+       *  the origin-feed authority check applies to user tokens only — which is what makes
+       *  this usable for moderation and for cleaning up content deleted in your own app. */
+      removeActivity: (activityId: string, opts: RequestOptions = {}) =>
+        this.call<void>('DELETE', `/v1/activities/${encodeURIComponent(activityId)}`, undefined, opts),
     }
   }
 

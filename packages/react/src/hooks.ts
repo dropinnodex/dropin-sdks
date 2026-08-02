@@ -72,7 +72,7 @@ function isAbort(err: unknown): boolean {
  * revalidate against the live feed. A warm provider cache (a prior fetch this session)
  * always wins over `initialData`, since it is fresher.
  *
- * @param opts.pollInterval - Milliseconds between automatic background `checkNew()` calls
+ * `opts.pollInterval` (deprecated — prefer `live`) is milliseconds between automatic background `checkNew()` calls
  * (the Twitter/IG "N new posts ↑" pattern). Omit or pass `0`/negative to disable — nothing
  * polls unless this is set. New activities are never auto-prepended: they land in a buffer
  * (`newCount`) until the app calls `showNew()`, so an open feed never jumps under the reader.

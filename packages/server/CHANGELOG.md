@@ -1,5 +1,25 @@
 # @dropinnodex/server
 
+## 0.6.0
+
+### Minor Changes
+
+- 3c728a5: Close the server SDK's route-coverage gaps, found by auditing every route against the
+  methods the SDK actually exposes.
+
+  - `feed().removeActivity(id)` — a server token may remove an activity from any feed
+    (the origin-feed check applies to user tokens only), which is what moderation and
+    "the underlying object was deleted in our database" cleanup need.
+  - `feed().followers(q)` / `.following(q)` — paged `Page<Follow>`, mirroring the client.
+  - `feed().suggestions(q)` — capped top-N, no cursor.
+  - `reactions.list(activityId, q)` — paged, optional `kind` filter.
+  - `notifications.list/markSeen/markRead({ owner, … })` — server tokens have no identity,
+    so each call names the user it acts for. Enables push notifications and digest emails
+    from a backend.
+
+  Deliberately still absent: `reactions.add`. A reaction needs an acting user and a server
+  token has none.
+
 ## 0.5.0
 
 ### Minor Changes
