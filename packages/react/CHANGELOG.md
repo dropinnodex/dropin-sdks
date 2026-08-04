@@ -1,5 +1,23 @@
 # @dropinnodex/react
 
+## 0.5.0
+
+### Minor Changes
+
+- dc22696: `useFeed` (and `useTimeline` / `useUserFeed`) gains promoted-activity support:
+  `promoted` (the eligible set), `items` (activities with promoted rows
+  interleaved), and `trackPromotedClick`. Placement is client-side via
+  `promotedPosition` / `promotedRepeatEvery` — repeat slots keep filling from the
+  cached sidecar as later pages load, with no extra request. `onPromotedImpression`
+  fires once per placed slot and `onPromotedClick` on click, so per-view numbers go
+  to your own analytics. `placePromoted()` is exported as a pure helper for
+  non-hook placement. `activities` is unchanged: promoted rows are never mixed in.
+
+### Patch Changes
+
+- Updated dependencies [dc22696]
+  - @dropinnodex/client@0.3.0
+
 ## 0.4.0
 
 ### Minor Changes

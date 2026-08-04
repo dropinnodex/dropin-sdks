@@ -1,5 +1,14 @@
 # @dropinnodex/client
 
+## 0.3.0
+
+### Minor Changes
+
+- dc22696: `feed().get()` now returns `FeedPage<TCustom>` — `Page<Activity>` plus an
+  optional `promoted` array of promoted activities. Present only on an uncursored
+  read; never inside `results`, and never affects `next`. Additive: the existing
+  `results` / `next` shape is unchanged.
+
 ## 0.2.0
 
 ### Minor Changes

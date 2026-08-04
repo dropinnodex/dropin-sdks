@@ -22,6 +22,37 @@ export interface Page<T> {
   next: string | null
 }
 
+/**
+ * A promoted activity — content the app wants seen regardless of who you follow or
+ * how recent it is. Activity-shaped so it renders through the same component, but it
+ * is not an activity: no `time`, no reactions, and it was never fanned out to a feed.
+ */
+export interface PromotedActivity<TCustom = Record<string, unknown>> {
+  id: string
+  actor: string
+  verb: string
+  object: string
+  custom: TCustom
+  /** Always true. Branch on it if you merge promoted rows into a list of activities. */
+  promoted: true
+}
+
+/**
+ * A page of a feed, plus the promoted sidecar.
+ *
+ * `promoted` is present ONLY on the first page (a request with no `next`) — absent,
+ * not empty, on every page after it, so you can tell "we didn't ask" from "nothing
+ * eligible". It is never inside `results` and never affects `next`: the cursor is a
+ * position in the real feed.
+ *
+ * Treat it as the eligible SET rather than a slot assignment — cache it and place
+ * those rows as often as you like while paging. `@dropinnodex/react` does this for
+ * you via `promotedPosition` / `promotedRepeatEvery`.
+ */
+export interface FeedPage<TCustom = Record<string, unknown>> extends Page<Activity<TCustom>> {
+  promoted?: PromotedActivity<TCustom>[]
+}
+
 export interface Follow {
   source_group: string
   source_id: string
@@ -207,7 +238,7 @@ export class DropInClient {
         q: { limit?: number; next?: string; /** @deprecated use `next` */ cursor?: string } = {},
         opts: RequestOptions = {},
       ) =>
-        this.call<Page<Activity<TCustom>>>('GET', `${base}${this.qs({ limit: q.limit, next: q.next ?? q.cursor })}`, undefined, opts),
+        this.call<FeedPage<TCustom>>('GET', `${base}${this.qs({ limit: q.limit, next: q.next ?? q.cursor })}`, undefined, opts),
       addActivity: <TCustom = Record<string, unknown>>(a: {
         verb: string; object: string; target?: string | null
         foreign_id?: string | null; time?: string; custom?: TCustom

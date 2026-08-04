@@ -1,5 +1,22 @@
 # @dropinnodex/server
 
+## 0.7.0
+
+### Minor Changes
+
+- dc22696: Add the `promoted` namespace: `promoted.create/list/remove` for promoted
+  activities — content served alongside a feed's first page regardless of the
+  follow graph or recency, with follow-graph targeting (`audience`), scheduling
+  (`starts_at` / `expires_at`), instant retraction, and a `served_count` delivery
+  counter. Server-token only. `feed().get()` now returns `FeedPage`, so an
+  SSR-prefetched page carries the `promoted` sidecar into `useFeed`'s
+  `initialData`.
+
+### Patch Changes
+
+- Updated dependencies [dc22696]
+  - @dropinnodex/client@0.3.0
+
 ## 0.6.0
 
 ### Minor Changes

@@ -8,11 +8,11 @@ import * as jose from 'jose'
 // @dropinnodex/server, not the reverse. This is what makes `feed().get()` return a typed
 // `Page<Activity<TCustom>>` instead of `unknown`, so SSR `initialData` flows typed end to end.
 import type {
-  Activity, Follow, FollowStats, Notification, NotificationPage, Page, Reaction,
+  Activity, FeedPage, Follow, FollowStats, Notification, NotificationPage, Page, PromotedActivity, Reaction,
   RequestOptions, Suggestion,
 } from '@dropinnodex/client'
 
-export type { RequestOptions, Follow, Notification, NotificationPage, Reaction, Suggestion }
+export type { RequestOptions, Follow, Notification, NotificationPage, PromotedActivity, Reaction, Suggestion }
 
 /**
  * A webhook destination. The delivery infrastructure owns storage and the full response
@@ -47,6 +47,48 @@ export type BatchResultItem =
 /** Per-item results of a batch import call. Partial failure is still a 200 — check each item. */
 export interface BatchResponse {
   results: BatchResultItem[]
+}
+
+/** What you send to promote something. */
+export interface PromotedActivityInput<TCustom = Record<string, unknown>> {
+  /** Free-form, and never overwritten: these routes are server-token only. e.g. "sponsor:nike". */
+  actor: string
+  verb: string
+  object: string
+  custom?: TCustom
+  /**
+   * Which feeds to target. Omit (or null) to reach EVERY user, including brand-new
+   * ones whose feed is otherwise empty. Otherwise feed refs the reader must follow —
+   * targeting is the follow graph, because we hold no user attributes. Max 20; a
+   * reader matching ANY of them is eligible.
+   */
+  audience?: string[] | null
+  /** ISO timestamp. Defaults to now; nothing is served before it. */
+  starts_at?: string
+  /** ISO timestamp, must be in the future. Null (or omitted) means "until you retract it". */
+  expires_at?: string | null
+}
+
+/** A promoted activity as your backend sees it — the full row, including targeting and counters. */
+export interface PromotedActivityRecord<TCustom = Record<string, unknown>> {
+  id: string
+  actor: string
+  verb: string
+  object: string
+  custom: TCustom
+  audience: string[] | null
+  starts_at: string
+  expires_at: string | null
+  /**
+   * Feed opens that received this row — DELIVERIES, not views. A reader who scrolls
+   * past four copies in one session counts once, and whether it entered the viewport
+   * is not observable server-side. For view-level numbers use the react SDK's
+   * `onPromotedImpression` callback and send them to your own analytics.
+   */
+  served_count: number
+  /** Set once retracted. Retracted rows stay listed here with their final count. */
+  deleted_at: string | null
+  created_at: string
 }
 
 const MAX_TTL_SECONDS = 86_400
@@ -189,6 +231,58 @@ export class DropInServer {
       this.call<void>('DELETE', `/v1/webhooks/${encodeURIComponent(id)}`, undefined, opts),
   }
 
+  /**
+   * Promoted activities: content that stays visible regardless of the follow graph
+   * and recency — an under-filled event, an announcement, a sponsor post, a member
+   * spotlight. Server-token only; creating one is a backend operation, usually
+   * automated.
+   *
+   * Nothing is fanned out. One row serves every eligible reader, which is why
+   * retracting or expiring is instant and costs nothing.
+   *
+   * **Targeting is the follow graph.** We store no user attributes, so an audience is
+   * expressed as feeds. Create a feed like `city:belgrade`, follow your users into it
+   * from your backend, then target it:
+   *
+   * ```ts
+   * await dropin.batch.follows([{ source: 'timeline:alice', target: 'city:belgrade' }])
+   * await dropin.promoted.create({
+   *   actor: 'system:fcurban',
+   *   verb: 'promote',
+   *   object: 'game:8842',
+   *   custom: { text: 'Thursday 20:00 — 6 spots left' },
+   *   audience: ['city:belgrade'],
+   *   expires_at: kickoffIso,          // stops serving itself; no cleanup
+   * })
+   * ```
+   *
+   * Eligible rows arrive in the `promoted` array of a feed read's FIRST page (never
+   * inside `results`, never affecting the cursor). That array is the eligible SET, not
+   * a slot assignment — the client caches it and decides placement.
+   *
+   * This is promoted content, not an ad platform: no bidding, no demographic
+   * targeting, no viewability tracking. The label your users see ("Sponsored",
+   * "Featured") — and any disclosure obligation that comes with paid placement — is
+   * yours to render.
+   */
+  readonly promoted = {
+    /** Promote something. Throws CONFLICT past 100 live rows (an abuse guard, not a plan limit). */
+    create: <TCustom = Record<string, unknown>>(
+      input: PromotedActivityInput<TCustom>,
+      opts: RequestOptions = {},
+    ) => this.call<PromotedActivityRecord<TCustom>>('POST', '/v1/promoted', input, opts),
+    /** Your inventory, newest first — retracted rows included, each with its `served_count`. */
+    list: <TCustom = Record<string, unknown>>(
+      q: { limit?: number; next?: string } = {},
+      opts: RequestOptions = {},
+    ) => this.call<Page<PromotedActivityRecord<TCustom>>>(
+      'GET', `/v1/promoted${qs({ limit: q.limit, next: q.next })}`, undefined, opts,
+    ),
+    /** Stop serving it. Takes effect on the next feed read; retracting twice is NOT_FOUND. */
+    remove: (id: string, opts: RequestOptions = {}) =>
+      this.call<void>('DELETE', `/v1/promoted/${encodeURIComponent(id)}`, undefined, opts),
+  }
+
   /** Cold-start import (server-token only, ≤100 items/call, quiet — no notifications,
    *  live pings, or webhooks fire for imported history; see the "Migrating existing
    *  data" guide). Per-item results: partial failure is still a 200, so check each
@@ -281,7 +375,9 @@ export class DropInServer {
         q: { limit?: number; next?: string; /** @deprecated use `next` */ cursor?: string } = {},
         opts: RequestOptions = {},
       ) =>
-        this.call<Page<Activity<TCustom>>>(
+        // FeedPage, not Page: a server-rendered first page carries the `promoted`
+        // sidecar too, and passing it into useFeed's initialData must not drop it.
+        this.call<FeedPage<TCustom>>(
           'GET', `${base}${qs({ limit: q.limit, next: q.next ?? q.cursor })}`, undefined, opts,
         ),
       followStats: (opts: RequestOptions = {}) =>

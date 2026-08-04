@@ -192,6 +192,49 @@ describe('DropInServer.webhooks', () => {
   })
 })
 
+describe('DropInServer.promoted', () => {
+  it('create POSTs the input body to /v1/promoted', async () => {
+    const fn = mockFetchOnce({ status: 201, json: { id: 'p1', served_count: 0 } })
+    const row = await dropin.promoted.create({
+      actor: 'system:fcurban', verb: 'promote', object: 'game:8842', audience: ['city:belgrade'],
+    })
+    const [url, opts] = lastCall(fn)
+    expect(new URL(url).pathname).toBe('/v1/promoted')
+    expect(opts.method).toBe('POST')
+    expect(JSON.parse(opts.body!)).toEqual({
+      actor: 'system:fcurban', verb: 'promote', object: 'game:8842', audience: ['city:belgrade'],
+    })
+    expect(row.id).toBe('p1')
+  })
+
+  it('list GETs with paging params and returns a page', async () => {
+    const fn = mockFetchOnce({ json: { results: [{ id: 'p1' }], next: 'cur' } })
+    const page = await dropin.promoted.list({ limit: 5, next: 'abc' })
+    const [url, opts] = lastCall(fn)
+    expect(opts.method).toBe('GET')
+    expect(new URL(url).pathname).toBe('/v1/promoted')
+    expect(new URL(url).searchParams.get('limit')).toBe('5')
+    expect(new URL(url).searchParams.get('next')).toBe('abc')
+    expect(page.next).toBe('cur')
+  })
+
+  it('remove DELETEs the encoded id', async () => {
+    const fn = mockFetchOnce({ status: 204, text: '' })
+    await dropin.promoted.remove('a/b')
+    const [url, opts] = lastCall(fn)
+    expect(opts.method).toBe('DELETE')
+    expect(new URL(url).pathname).toBe('/v1/promoted/a%2Fb')
+  })
+
+  it('carries the server-token bearer, like every other server-only route', async () => {
+    const fn = mockFetchOnce({ status: 201, json: { id: 'p1' } })
+    await dropin.promoted.create({ actor: 'a', verb: 'v', object: 'o' })
+    const [, opts] = lastCall(fn)
+    expect(opts.headers.authorization).toMatch(/^Bearer /)
+    expect(opts.headers['x-api-key']).toBe('dk_test')
+  })
+})
+
 describe('DropInServer.batch', () => {
   it('users POSTs /v1/batch/users with the envelope body and returns parsed results', async () => {
     const results = [{ index: 0, ok: true, id: 'alice' }, { index: 1, ok: false, code: 'INVALID_ARGUMENT' }]

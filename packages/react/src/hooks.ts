@@ -1,5 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import type { Activity, Follow, Notification, Page, Reaction, Suggestion } from '@dropinnodex/client'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type {
+  Activity, FeedPage, Follow, Notification, Page, PromotedActivity, Reaction, Suggestion,
+} from '@dropinnodex/client'
 import { useDropInContext, useDropInClientOrNull, type CacheEntry } from './provider.js'
 import { useLiveTicks } from './use-live.js'
 
@@ -57,6 +59,54 @@ function isAbort(err: unknown): boolean {
   return err instanceof Error && err.name === 'AbortError'
 }
 
+/** One rendered row: a real activity, or a promoted one. Branch with `'promoted' in item`. */
+export type FeedItem<TCustom = Record<string, unknown>> = Activity<TCustom> | PromotedActivity<TCustom>
+
+export interface PlacePromotedOptions {
+  /** How many activities precede the first promoted slot. Default 3. */
+  position?: number
+  /** Activities between slots. `null`/omitted places exactly once. */
+  repeatEvery?: number | null
+}
+
+/**
+ * Interleave promoted activities into a list of activities. Pure — usable outside
+ * React, and the whole of the placement policy.
+ *
+ * The sidecar is an eligible SET, not a slot assignment: the same rows may be placed
+ * as many times as you like, and consecutive slots rotate through the set (wrapping),
+ * so two eligible rows alternate rather than one hogging every slot.
+ *
+ * A feed shorter than `position` — including an empty one — still gets its first slot
+ * at the end. That is deliberate: a brand-new user with an empty feed is exactly the
+ * cold-start case promoted content exists to fill.
+ */
+export function placePromoted<TCustom = Record<string, unknown>>(
+  activities: Activity<TCustom>[],
+  promoted: PromotedActivity<TCustom>[] | undefined,
+  opts: PlacePromotedOptions = {},
+): FeedItem<TCustom>[] {
+  if (promoted === undefined || promoted.length === 0) return activities
+  const position = Math.max(0, opts.position ?? 3)
+  const repeat = opts.repeatEvery ?? null
+
+  const slots: number[] = [Math.min(position, activities.length)]
+  if (repeat !== null && repeat > 0) {
+    for (let at = slots[0]! + repeat; at <= activities.length; at += repeat) slots.push(at)
+  }
+
+  const out: FeedItem<TCustom>[] = []
+  let slot = 0
+  for (let i = 0; i <= activities.length; i++) {
+    while (slot < slots.length && slots[slot] === i) {
+      out.push(promoted[slot % promoted.length]!)
+      slot++
+    }
+    if (i < activities.length) out.push(activities[i]!)
+  }
+  return out
+}
+
 /**
  * Loads a feed's first page and keeps it fresh, with optimistic `loadNext`/`addActivity`/
  * `refresh` helpers.
@@ -96,18 +146,33 @@ function isAbort(err: unknown): boolean {
  * `isLoading: false`, `error: null`, `enabled: false`, all functions no-op resolving
  * `undefined`, zero network — `initialData` and polling are ignored too.
  */
+export interface UseFeedOptions<TCustom = Record<string, unknown>> {
+  initialData?: FeedPage<TCustom> | Page<Activity<TCustom>>
+  /** @deprecated Use `live: true` — cheaper (head check, not a full read) and
+   * visibility-aware. Kept working; ignored when `live` is set. */
+  pollInterval?: number
+  /** Keep this feed fresh: cheap head check every 5s while visible, paused while
+   * hidden, full fetch only when something actually changed. */
+  live?: boolean
+  /** Activities before the first promoted slot in `items`. Default 3. */
+  promotedPosition?: number
+  /** Activities between promoted slots. Omit (or null) to place exactly once. */
+  promotedRepeatEvery?: number | null
+  /**
+   * Fired once per PLACED SLOT — when a promoted row enters `items`, not when it
+   * enters the viewport (which we cannot see from here). Wire an
+   * IntersectionObserver yourself if you need true viewability; this is the hook
+   * for sending an event to your own analytics.
+   */
+  onPromotedImpression?: (promoted: PromotedActivity<TCustom>, ctx: { slot: number }) => void
+  /** Invoked by the returned `trackPromotedClick`. */
+  onPromotedClick?: (promoted: PromotedActivity<TCustom>) => void
+}
+
 export function useFeed<TCustom = Record<string, unknown>>(
   group: string,
   id: string,
-  opts?: {
-    initialData?: Page<Activity<TCustom>>
-    /** @deprecated Use `live: true` — cheaper (head check, not a full read) and
-     * visibility-aware. Kept working; ignored when `live` is set. */
-    pollInterval?: number
-    /** Keep this feed fresh: cheap head check every 5s while visible, paused while
-     * hidden, full fetch only when something actually changed. */
-    live?: boolean
-  },
+  opts?: UseFeedOptions<TCustom>,
 ) {
   const { client, cache } = useDropInContext()
   const enabled = client !== null
@@ -116,7 +181,10 @@ export function useFeed<TCustom = Record<string, unknown>>(
   // TCustom — serves every TCustom a caller might use across the app), so both the read
   // and the write need a cast at this boundary rather than threading TCustom through the
   // provider/cache types.
-  type Entry = { activities: Activity<TCustom>[]; next: string | null }
+  // `promoted` rides in the cache entry so a remount renders the same slots straight
+  // away instead of losing them until the next uncursored read (later pages never
+  // carry a sidecar, so it cannot be recovered by paging).
+  type Entry = { activities: Activity<TCustom>[]; next: string | null; promoted?: PromotedActivity<TCustom>[] }
   // Seed from the provider cache: a remount or a second component on the
   // same feed renders instantly from the last fetch, then refreshes. A cache hit wins
   // over caller-supplied initialData — the cache means we already fetched fresher data
@@ -127,10 +195,17 @@ export function useFeed<TCustom = Record<string, unknown>>(
   // Disabled mode ignores seeds too: the contract is EMPTY data, not "whatever
   // initialData happened to carry" — inert must be predictable.
   const seed: Entry | undefined = !enabled ? undefined : cached ?? (opts?.initialData
-    ? { activities: opts.initialData.results, next: opts.initialData.next }
+    ? {
+        activities: opts.initialData.results,
+        next: opts.initialData.next,
+        // An SSR-prefetched first page carries the sidecar too — keep it, or the
+        // server-rendered markup and the first client render would disagree.
+        ...('promoted' in opts.initialData ? { promoted: opts.initialData.promoted } : {}),
+      }
     : undefined)
   const [activities, setActivities] = useState<Activity<TCustom>[]>(seed?.activities ?? [])
   const [next, setNext] = useState<string | null>(seed?.next ?? null)
+  const [promoted, setPromoted] = useState<PromotedActivity<TCustom>[]>(seed?.promoted ?? [])
   const [isLoading, setLoading] = useState(enabled && seed === undefined)
   const [error, setError] = useState<Error | null>(null)
   // Buffer for checkNew()/showNew() — activities polled in but not yet flushed into
@@ -140,6 +215,8 @@ export function useFeed<TCustom = Record<string, unknown>>(
   const [pending, setPending] = useState<Activity<TCustom>[]>([])
   const activitiesRef = useRef(activities)
   activitiesRef.current = activities
+  const promotedRef = useRef(promoted)
+  promotedRef.current = promoted
   const pendingRef = useRef(pending)
   pendingRef.current = pending
   // Tracks the live feedKey so an in-flight checkNew from a feed that's since been
@@ -179,9 +256,13 @@ export function useFeed<TCustom = Record<string, unknown>>(
     client.feed(group, id).get<TCustom>({ limit: 20 }, { signal: ctrl.signal })
       .then((page) => {
         if (cancelled) return
-        setCache({ activities: page.results, next: page.next })
+        // An uncursored read is the only thing that ever carries the sidecar; `?? []`
+        // so a server without the feature degrades to "nothing eligible", not undefined.
+        const side = page.promoted ?? []
+        setCache({ activities: page.results, next: page.next, promoted: side })
         setActivities(page.results)
         setNext(page.next)
+        setPromoted(side)
       })
       .catch((err: unknown) => { if (!cancelled && !isAbort(err)) setError(err as Error) })
       .finally(() => { if (!cancelled) setLoading(false) })
@@ -198,7 +279,9 @@ export function useFeed<TCustom = Record<string, unknown>>(
       const page = await client.feed(group, id).get<TCustom>({ limit: 20, next }, { signal })
       setActivities((prev) => {
         const merged = [...prev, ...page.results]
-        setCache({ activities: merged, next: page.next })
+        // Page 2+ carries no sidecar by contract — carry the cached one forward so
+        // repeat placement keeps filling slots as the list grows.
+        setCache({ activities: merged, next: page.next, promoted: promotedRef.current })
         return merged
       })
       setNext(page.next)
@@ -230,9 +313,13 @@ export function useFeed<TCustom = Record<string, unknown>>(
     setError(null)
     try {
       const page = await client.feed(group, id).get<TCustom>({ limit: 20 }, { signal })
-      setCache({ activities: page.results, next: page.next })
+      // refresh() is an uncursored read, so it also re-resolves eligibility — which is
+      // how a promotion that expired mid-session stops rendering from the client cache.
+      const side = page.promoted ?? []
+      setCache({ activities: page.results, next: page.next, promoted: side })
       setActivities(page.results)
       setNext(page.next)
+      setPromoted(side)
       // refresh() authoritatively replaces activities from the server, so any
       // checkNew() buffer is now stale (page 1 may already include what it buffered,
       // e.g. an at-least-once replay) — drop it, or showNew() would later duplicate.
@@ -262,7 +349,7 @@ export function useFeed<TCustom = Record<string, unknown>>(
       const cur = activitiesRef.current
       // A previously-empty feed has nothing to "jump" — load its first activities directly.
       if (cur.length === 0) {
-        setCache({ activities: page.results, next: page.next })
+        setCache({ activities: page.results, next: page.next, promoted: promotedRef.current })
         setActivities(page.results)
         setNext(page.next)
         return
@@ -331,22 +418,66 @@ export function useFeed<TCustom = Record<string, unknown>>(
     return () => clearInterval(t)
   }, [opts?.live, opts?.pollInterval, checkNew])
 
+  // Placement is presentation, so it happens here rather than server-side: the server
+  // answers WHAT is eligible, the client decides WHERE it goes.
+  const promotedPosition = opts?.promotedPosition
+  const promotedRepeatEvery = opts?.promotedRepeatEvery
+  const items = useMemo(
+    () => placePromoted<TCustom>(activities, promoted, {
+      ...(promotedPosition !== undefined ? { position: promotedPosition } : {}),
+      ...(promotedRepeatEvery !== undefined ? { repeatEvery: promotedRepeatEvery } : {}),
+    }),
+    [activities, promoted, promotedPosition, promotedRepeatEvery],
+  )
+
+  // Impressions fire per PLACED SLOT, once each. Keyed by `${id}#${slot}` so the same
+  // row placed at two slots counts twice (that is what repeat placement means) while a
+  // re-render of the same slots counts zero more. Reset when the feed changes.
+  const onImpression = opts?.onPromotedImpression
+  const firedRef = useRef(new Set<string>())
+  useEffect(() => { firedRef.current = new Set() }, [feedKey])
+  useEffect(() => {
+    if (!enabled || onImpression === undefined) return
+    let slot = 0
+    for (const item of items) {
+      if (!('promoted' in item)) continue
+      const key = `${item.id}#${slot}`
+      if (!firedRef.current.has(key)) {
+        firedRef.current.add(key)
+        onImpression(item, { slot })
+      }
+      slot++
+    }
+  }, [items, enabled, onImpression])
+
+  const onClick = opts?.onPromotedClick
+  /** Call from your row's click handler; forwards to `onPromotedClick`. */
+  const trackPromotedClick = useCallback(
+    (p: PromotedActivity<TCustom>) => { if (enabled) onClick?.(p) },
+    [enabled, onClick],
+  )
+
   return {
     activities, loadNext, hasNext: next !== null, isLoading, error, addActivity, refresh,
     newCount: pending.length, showNew, checkNew, enabled,
+    /** The eligible promoted set for this reader — NOT placed. Empty when none. */
+    promoted,
+    /** `activities` with promoted rows interleaved per the placement props. */
+    items,
+    trackPromotedClick,
   }
 }
 
 /** `useFeed('timeline', uid, opts)` — the feed aggregating who this user follows. */
 export function useTimeline<TCustom = Record<string, unknown>>(
   uid: string,
-  opts?: { initialData?: Page<Activity<TCustom>>; pollInterval?: number; live?: boolean },
+  opts?: UseFeedOptions<TCustom>,
 ) { return useFeed<TCustom>('timeline', uid, opts) }
 
 /** `useFeed('user', uid, opts)` — a single user's own activity feed. */
 export function useUserFeed<TCustom = Record<string, unknown>>(
   uid: string,
-  opts?: { initialData?: Page<Activity<TCustom>>; pollInterval?: number; live?: boolean },
+  opts?: UseFeedOptions<TCustom>,
 ) { return useFeed<TCustom>('user', uid, opts) }
 
 /** GetStream V3 alias for `useFeed` — same signature and return. */

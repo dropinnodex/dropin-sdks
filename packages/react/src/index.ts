@@ -2,6 +2,9 @@ export { DropInProvider, useDropInClient, useDropInClientOrNull, useDropInEnable
 export {
   useFeed, useReactions, useFollow, useFollowing, useFeedActions, useTimeline, useUserFeed,
   useFeedActivities, useFollowStats, useNotifications, useReactionList, useFollowers, useCurrentUser,
-  useSuggestions,
+  useSuggestions, placePromoted,
 } from './hooks.js'
-export type { OptimisticOnError, OptimisticOnErrorCtx } from './hooks.js'
+export type {
+  OptimisticOnError, OptimisticOnErrorCtx, FeedItem, PlacePromotedOptions, UseFeedOptions,
+} from './hooks.js'
+export type { PromotedActivity } from '@dropinnodex/client'

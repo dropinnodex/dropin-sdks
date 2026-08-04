@@ -65,10 +65,13 @@ describe('DropInProvider enabled={false}', () => {
     expect(result.current.enabled).toBe(false)
     expect(result.current.hasNext).toBe(false)
     expect(result.current.newCount).toBe(0)
+    expect(result.current.promoted).toEqual([])
+    expect(result.current.items).toEqual([])
     // Shape keys, not just values — the inert return must mirror the live one (plus `enabled`).
     expect(Object.keys(result.current).sort()).toEqual([
       'activities', 'addActivity', 'checkNew', 'enabled', 'error', 'hasNext',
-      'isLoading', 'loadNext', 'newCount', 'refresh', 'showNew',
+      'isLoading', 'items', 'loadNext', 'newCount', 'promoted', 'refresh',
+      'showNew', 'trackPromotedClick',
     ])
     // Its action/read fns are no-ops resolving undefined.
     await act(async () => {
