@@ -1,5 +1,22 @@
 # @dropinnodex/server
 
+## 0.7.1
+
+### Patch Changes
+
+- 2286486: Fix `feed().follow()` (and any other empty-body success) throwing
+  `SyntaxError: Unexpected end of JSON input`.
+
+  `POST /v1/feeds/:group/:id/follows` answers **201 with no body**, but the SDK only
+  treated `204` as empty and called `res.json()` on everything else — which throws on an
+  empty body. Every successful follow through the server SDK rejected. It now reads the
+  body text once and parses only when there is something to parse, matching
+  `@dropinnodex/client`, which already handled it this way.
+
+  The unit tests missed it because the fetch mock returned `undefined` from `json()`
+  instead of throwing, and defaulted `text()` to `''` while `json()` returned an object —
+  something no real `Response` does. The mock now derives `text()` from the same payload.
+
 ## 0.7.0
 
 ### Minor Changes

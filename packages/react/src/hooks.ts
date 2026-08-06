@@ -59,6 +59,21 @@ function isAbort(err: unknown): boolean {
   return err instanceof Error && err.name === 'AbortError'
 }
 
+/**
+ * Append `incoming` to `prev`, dropping anything already present by id.
+ *
+ * A page boundary is not a set boundary: a row inserted ahead of the cursor, or an
+ * at-least-once fan-out replay, can put the same activity in two consecutive pages. A
+ * bare `[...prev, ...page.results]` then renders duplicate React keys — which a
+ * virtualised list treats as a crash, not a cosmetic glitch.
+ */
+function mergeById<T extends { id: string }>(prev: T[], incoming: T[]): T[] {
+  if (incoming.length === 0) return prev
+  const seen = new Set(prev.map((a) => a.id))
+  const fresh = incoming.filter((a) => !seen.has(a.id))
+  return fresh.length === 0 ? prev : [...prev, ...fresh]
+}
+
 /** One rendered row: a real activity, or a promoted one. Branch with `'promoted' in item`. */
 export type FeedItem<TCustom = Record<string, unknown>> = Activity<TCustom> | PromotedActivity<TCustom>
 
@@ -112,7 +127,22 @@ export function placePromoted<TCustom = Record<string, unknown>>(
  * `refresh` helpers.
  *
  * Returns `{ activities, loadNext, hasNext, isLoading, error, addActivity, refresh,
- * newCount, showNew, checkNew }`.
+ * newCount, showNew, checkNew }`, plus the infinite-scroll set: `canLoadMore`, `retry`,
+ * `isLoadingInitial`, `isLoadingMore`.
+ *
+ * INFINITE SCROLL. Driving `loadNext` from an IntersectionObserver is not the same
+ * problem as driving it from a button — the observer fires on intersect and again on
+ * every reflow, so what a button reaches once, a sentinel reaches constantly:
+ *
+ * - Bind the sentinel to `canLoadMore`, not `hasNext`. It also folds in "a page is
+ *   already in flight" and "the last page failed and nobody has acknowledged it".
+ * - Gate a full-page spinner on `isLoadingInitial`, never on `isLoading`. The shared
+ *   flag is true during `loadNext` too, so a list gated on it unmounts its own sentinel
+ *   mid-fetch and scrolling stops for good.
+ * - `loadNext` is internally guarded anyway: a call while a page is in flight, or while
+ *   `error` is set, is a no-op rather than a duplicate request on the same cursor.
+ *   Pages merge deduped by id, so an overlapping page cannot produce duplicate keys.
+ * - `retry()` is the only way past the error guard. Wire it to a button.
  *
  * @param opts.initialData - Server-prefetched page for SSR/SSG hydration, e.g.
  * `{ initialData: await server.feed(group, id).get() }` (the shape is `@dropinnodex/client`'s
@@ -148,6 +178,11 @@ export function placePromoted<TCustom = Record<string, unknown>>(
  */
 export interface UseFeedOptions<TCustom = Record<string, unknown>> {
   initialData?: FeedPage<TCustom> | Page<Activity<TCustom>>
+  /** Rows per request, for every read this hook makes (first page, `loadNext`,
+   *  `refresh`, `checkNew`). Default 20. Raise it for infinite scroll on a desktop
+   *  viewport, where 20 rows can be a single screen and each scroll costs a round trip.
+   *  `newCount` saturates at this value — see `checkNew` below. */
+  pageSize?: number
   /** @deprecated Use `live: true` — cheaper (head check, not a full read) and
    * visibility-aware. Kept working; ignored when `live` is set. */
   pollInterval?: number
@@ -177,6 +212,7 @@ export function useFeed<TCustom = Record<string, unknown>>(
   const { client, cache } = useDropInContext()
   const enabled = client !== null
   const feedKey = `${group}:${id}`
+  const pageSize = opts?.pageSize ?? 20
   // The cache is intentionally shared/untyped (one CacheEntry — fixed to the default
   // TCustom — serves every TCustom a caller might use across the app), so both the read
   // and the write need a cast at this boundary rather than threading TCustom through the
@@ -206,8 +242,20 @@ export function useFeed<TCustom = Record<string, unknown>>(
   const [activities, setActivities] = useState<Activity<TCustom>[]>(seed?.activities ?? [])
   const [next, setNext] = useState<string | null>(seed?.next ?? null)
   const [promoted, setPromoted] = useState<PromotedActivity<TCustom>[]>(seed?.promoted ?? [])
-  const [isLoading, setLoading] = useState(enabled && seed === undefined)
+  // Two loading flags, not one. `isLoadingInitial` covers the reads that REPLACE the list
+  // (mount, feed switch, refresh) — the only ones a full-page spinner should gate.
+  // `isLoadingMore` covers loadNext, which APPENDS: a list gated on the shared flag
+  // unmounts its scroll sentinel mid-fetch, so scrolling stalls permanently and the
+  // reader loses their position. `isLoading` stays their union, so every caller written
+  // against the single-flag shape keeps working.
+  const [isLoadingInitial, setLoadingInitial] = useState(enabled && seed === undefined)
+  const [isLoadingMore, setLoadingMore] = useState(false)
+  const isLoading = isLoadingInitial || isLoadingMore
   const [error, setError] = useState<Error | null>(null)
+  // Mirrors isLoadingMore for the in-flight guard: state is a render behind, and an
+  // IntersectionObserver re-fires (on intersect, then again as content reflows) long
+  // before React has re-rendered with the new flag.
+  const loadingMoreRef = useRef(false)
   // Buffer for checkNew()/showNew() — activities polled in but not yet flushed into
   // `activities`. Refs mirror the latest state so checkNew (a useCallback with a stable
   // identity for the poll-effect's timer) always dedupes against current data, not a
@@ -242,7 +290,9 @@ export function useFeed<TCustom = Record<string, unknown>>(
     // `seed` is intentionally NOT in the deps array: it's a fresh object each render, so
     // listing it would refetch every render. The effect only needs the value from the
     // render that created it (mount / feed-key change). Do not "fix" this with exhaustive-deps.
-    setLoading(seed === undefined)
+    setLoadingInitial(seed === undefined)
+    setLoadingMore(false)
+    loadingMoreRef.current = false // a page-2 fetch from the previous feed is now irrelevant
     setError(null)
     // A feedKey change (or mount) must invalidate any buffered checkNew() results:
     // they belong to whichever feed was live when they were fetched, and pending is
@@ -253,7 +303,7 @@ export function useFeed<TCustom = Record<string, unknown>>(
     // Publish SSR initialData to the shared cache so a sibling/remounted useFeed on the
     // same feed renders from it too (not just this instance), until the fetch lands.
     if (cache.get(feedKey) === undefined && seed !== undefined) cache.set(feedKey, seed as CacheEntry)
-    client.feed(group, id).get<TCustom>({ limit: 20 }, { signal: ctrl.signal })
+    client.feed(group, id).get<TCustom>({ limit: pageSize }, { signal: ctrl.signal })
       .then((page) => {
         if (cancelled) return
         // An uncursored read is the only thing that ever carries the sidecar; `?? []`
@@ -265,20 +315,23 @@ export function useFeed<TCustom = Record<string, unknown>>(
         setPromoted(side)
       })
       .catch((err: unknown) => { if (!cancelled && !isAbort(err)) setError(err as Error) })
-      .finally(() => { if (!cancelled) setLoading(false) })
+      .finally(() => { if (!cancelled) setLoadingInitial(false) })
     // abort() cancels the request itself; `cancelled` still guards the state writes, since
     // a response that already landed resolves regardless of the signal.
     return () => { cancelled = true; ctrl.abort() }
-  }, [client, cache, feedKey, group, id])
+  }, [client, cache, feedKey, group, id, pageSize])
 
-  const loadNext = useCallback(async () => {
+  // The fetch itself, with no policy: `loadNext` and `retry` differ only in which guards
+  // they apply before calling this.
+  const fetchNext = useCallback(async () => {
     if (client === null || next === null) return
     const signal = readSignal()
-    setLoading(true)
+    loadingMoreRef.current = true
+    setLoadingMore(true)
     try {
-      const page = await client.feed(group, id).get<TCustom>({ limit: 20, next }, { signal })
+      const page = await client.feed(group, id).get<TCustom>({ limit: pageSize, next }, { signal })
       setActivities((prev) => {
-        const merged = [...prev, ...page.results]
+        const merged = mergeById(prev, page.results)
         // Page 2+ carries no sidecar by contract — carry the cached one forward so
         // repeat placement keeps filling slots as the list grows.
         setCache({ activities: merged, next: page.next, promoted: promotedRef.current })
@@ -288,9 +341,32 @@ export function useFeed<TCustom = Record<string, unknown>>(
     } catch (err) {
       if (!isAbort(err)) setError(err as Error)
     } finally {
-      if (!signal?.aborted) setLoading(false)
+      loadingMoreRef.current = false
+      if (!signal?.aborted) setLoadingMore(false)
     }
-  }, [client, cache, feedKey, group, id, next])
+  }, [client, cache, feedKey, group, id, next, pageSize])
+
+  /**
+   * Append the next page. Safe to call from an IntersectionObserver: it is a no-op at
+   * end-of-feed, while a page is already in flight, and while `error` is set.
+   *
+   * The error guard is what stops a sentinel from hammering: a failed page leaves `next`
+   * unchanged, so an unguarded retry re-issues the identical request for as long as the
+   * sentinel stays intersecting — which, with the list short one page, is forever. Call
+   * `retry()` to clear the error and try that same cursor again.
+   */
+  const loadNext = useCallback(async () => {
+    if (loadingMoreRef.current || error !== null) return
+    await fetchNext()
+  }, [fetchNext, error])
+
+  /** Clear the error and re-issue the failed page. The explicit escape from the error
+   *  guard above — wire it to a "Try again" button, never to the sentinel. */
+  const retry = useCallback(async () => {
+    if (loadingMoreRef.current) return
+    setError(null)
+    await fetchNext()
+  }, [fetchNext])
 
   const addActivity = useCallback(
     async (a: { verb: string; object: string; target?: string | null; foreign_id?: string | null; time?: string; custom?: TCustom }) => {
@@ -309,10 +385,11 @@ export function useFeed<TCustom = Record<string, unknown>>(
   const refresh = useCallback(async () => {
     if (client === null) return
     const signal = readSignal()
-    setLoading(true)
+    // refresh() REPLACES the list, so it is an initial-style load, not a "more" one.
+    setLoadingInitial(true)
     setError(null)
     try {
-      const page = await client.feed(group, id).get<TCustom>({ limit: 20 }, { signal })
+      const page = await client.feed(group, id).get<TCustom>({ limit: pageSize }, { signal })
       // refresh() is an uncursored read, so it also re-resolves eligibility — which is
       // how a promotion that expired mid-session stops rendering from the client cache.
       const side = page.promoted ?? []
@@ -327,9 +404,9 @@ export function useFeed<TCustom = Record<string, unknown>>(
     } catch (err) {
       if (!isAbort(err)) setError(err as Error)
     } finally {
-      if (!signal?.aborted) setLoading(false)
+      if (!signal?.aborted) setLoadingInitial(false)
     }
-  }, [client, cache, feedKey, group, id])
+  }, [client, cache, feedKey, group, id, pageSize])
 
   // Polls page 1 and BUFFERS anything newer than what's shown — never auto-prepends,
   // so an open feed never jumps under the reader (the "N new posts ↑" pattern; the app
@@ -341,7 +418,7 @@ export function useFeed<TCustom = Record<string, unknown>>(
     // blip, expired token) must not surface as an unhandled rejection or blank a working
     // feed — swallow it silently, same spirit as stale-while-revalidate. Never setError.
     try {
-      const page = await client.feed(group, id).get<TCustom>({ limit: 20 }, { signal: readSignal() })
+      const page = await client.feed(group, id).get<TCustom>({ limit: pageSize }, { signal: readSignal() })
       // The feed this call was fetching for may have been switched away from (group/id
       // changed) while the request was in flight — drop a result that would otherwise
       // write another feed's activities into this (now different) feed's state.
@@ -371,7 +448,7 @@ export function useFeed<TCustom = Record<string, unknown>>(
     } catch {
       // Swallowed — see best-effort comment above.
     }
-  }, [client, cache, feedKey, group, id])
+  }, [client, cache, feedKey, group, id, pageSize])
 
   // live: signal-consumption head polling (spec 2026-07-31-live-updates). lastHeadRef is
   // the last head value ACTED ON — deliberately not compared against list contents: a
@@ -460,6 +537,13 @@ export function useFeed<TCustom = Record<string, unknown>>(
   return {
     activities, loadNext, hasNext: next !== null, isLoading, error, addActivity, refresh,
     newCount: pending.length, showNew, checkNew, enabled,
+    /** Bind an infinite-scroll sentinel to THIS, not to `hasNext`: it folds in the two
+     *  states where another fetch would be wrong — one already in flight, and an
+     *  unacknowledged error on the same cursor. */
+    canLoadMore: next !== null && !isLoadingMore && error === null,
+    isLoadingInitial,
+    isLoadingMore,
+    retry,
     /** The eligible promoted set for this reader — NOT placed. Empty when none. */
     promoted,
     /** `activities` with promoted rows interleaved per the placement props. */

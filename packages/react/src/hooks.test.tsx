@@ -318,6 +318,117 @@ describe('useFeed', () => {
   })
 })
 
+// Infinite scroll drives loadNext from an IntersectionObserver, not a button: the call
+// fires on intersect AND again as content reflows, so concurrency and error-retry stop
+// being edge cases and become the normal path. Each test below is a failure mode that a
+// button never reaches.
+describe('useFeed infinite scroll', () => {
+  /** A promise the test resolves by hand, to hold a page in flight. */
+  function deferred<T>() {
+    let resolve!: (v: T) => void
+    const promise = new Promise<T>((r) => { resolve = r })
+    return { promise, resolve }
+  }
+
+  it('drops a second loadNext while one is in flight (same cursor, one fetch)', async () => {
+    const page2 = deferred<unknown>()
+    const get = vi.fn()
+      .mockResolvedValueOnce({ results: [activity('a1')], next: 'cur1' })
+      .mockImplementationOnce(() => page2.promise)
+    const client = makeClient({ feed: vi.fn(() => ({ get })) })
+    const { result } = renderHook(() => useFeed('timeline', 'alice'), { wrapper: wrapper(client) })
+    await waitFor(() => expect(result.current.hasNext).toBe(true))
+
+    await act(async () => {
+      const first = result.current.loadNext()
+      const second = result.current.loadNext() // observer re-fires before page 2 lands
+      page2.resolve({ results: [activity('a2')], next: null })
+      await Promise.all([first, second])
+    })
+
+    expect(get).toHaveBeenCalledTimes(2) // mount + ONE loadNext, not two
+    expect(result.current.activities.map((a) => a.id)).toEqual(['a1', 'a2'])
+  })
+
+  it('dedupes by id when a page overlaps what is already shown', async () => {
+    const get = vi.fn()
+      .mockResolvedValueOnce({ results: [activity('a1'), activity('a2')], next: 'cur1' })
+      .mockResolvedValueOnce({ results: [activity('a2'), activity('a3')], next: null })
+    const client = makeClient({ feed: vi.fn(() => ({ get })) })
+    const { result } = renderHook(() => useFeed('timeline', 'alice'), { wrapper: wrapper(client) })
+    await waitFor(() => expect(result.current.hasNext).toBe(true))
+    await act(async () => { await result.current.loadNext() })
+    // a2 arrives twice (at-least-once fan-out replay, or a row inserted mid-page) —
+    // duplicate React keys are a crash in a virtualised list, so the merge must dedupe.
+    expect(result.current.activities.map((a) => a.id)).toEqual(['a1', 'a2', 'a3'])
+  })
+
+  it('splits isLoadingInitial from isLoadingMore (isLoading stays their union)', async () => {
+    const page2 = deferred<unknown>()
+    const get = vi.fn()
+      .mockResolvedValueOnce({ results: [activity('a1')], next: 'cur1' })
+      .mockImplementationOnce(() => page2.promise)
+    const client = makeClient({ feed: vi.fn(() => ({ get })) })
+    const { result } = renderHook(() => useFeed('timeline', 'alice'), { wrapper: wrapper(client) })
+
+    expect(result.current.isLoadingInitial).toBe(true)
+    expect(result.current.isLoadingMore).toBe(false)
+    await waitFor(() => expect(result.current.isLoading).toBe(false))
+
+    let pending!: Promise<void>
+    await act(async () => { pending = result.current.loadNext() })
+    // The whole point: a list gated on isLoadingInitial keeps rendering (and keeps its
+    // sentinel mounted) while page 2 is in flight.
+    expect(result.current.isLoadingInitial).toBe(false)
+    expect(result.current.isLoadingMore).toBe(true)
+    expect(result.current.isLoading).toBe(true)
+
+    await act(async () => { page2.resolve({ results: [activity('a2')], next: null }); await pending })
+    expect(result.current.isLoadingMore).toBe(false)
+  })
+
+  it('canLoadMore folds end-of-feed, in-flight and error', async () => {
+    const client = makeClient() // next: null
+    const { result } = renderHook(() => useFeed('timeline', 'alice'), { wrapper: wrapper(client) })
+    await waitFor(() => expect(result.current.isLoading).toBe(false))
+    expect(result.current.canLoadMore).toBe(false) // exhausted
+  })
+
+  it('a failed page stops canLoadMore and loadNext no-ops until retry()', async () => {
+    const get = vi.fn()
+      .mockResolvedValueOnce({ results: [activity('a1')], next: 'cur1' })
+      .mockRejectedValueOnce(new Error('page 2 boom'))
+      .mockResolvedValueOnce({ results: [activity('a2')], next: null })
+    const client = makeClient({ feed: vi.fn(() => ({ get })) })
+    const { result } = renderHook(() => useFeed('timeline', 'alice'), { wrapper: wrapper(client) })
+    await waitFor(() => expect(result.current.hasNext).toBe(true))
+
+    await act(async () => { await result.current.loadNext() })
+    expect(result.current.error).not.toBeNull()
+    expect(result.current.canLoadMore).toBe(false) // sentinel unbinds instead of hammering
+
+    // An intersecting sentinel keeps calling: every one of these must be a no-op.
+    await act(async () => { await result.current.loadNext(); await result.current.loadNext() })
+    expect(get).toHaveBeenCalledTimes(2) // mount + the one failed page
+
+    await act(async () => { await result.current.retry() })
+    expect(result.current.error).toBeNull()
+    expect(result.current.activities.map((a) => a.id)).toEqual(['a1', 'a2'])
+  })
+
+  it('pageSize replaces the hardcoded limit of 20 on both the first page and loadNext', async () => {
+    const get = vi.fn()
+      .mockResolvedValueOnce({ results: [activity('a1')], next: 'cur1' })
+      .mockResolvedValueOnce({ results: [activity('a2')], next: null })
+    const client = makeClient({ feed: vi.fn(() => ({ get })) })
+    const { result } = renderHook(() => useFeed('timeline', 'alice', { pageSize: 50 }), { wrapper: wrapper(client) })
+    await waitFor(() => expect(result.current.hasNext).toBe(true))
+    expect(get).toHaveBeenNthCalledWith(1, expect.objectContaining({ limit: 50 }), expect.anything())
+    await act(async () => { await result.current.loadNext() })
+    expect(get).toHaveBeenNthCalledWith(2, expect.objectContaining({ limit: 50, next: 'cur1' }), expect.anything())
+  })
+})
+
 describe('useFeed live', () => {
   it('head unchanged → no feed fetch; head changed → exactly one checkNew per distinct value', async () => {
     vi.useFakeTimers()

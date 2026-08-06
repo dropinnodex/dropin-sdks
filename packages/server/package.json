@@ -1,6 +1,6 @@
 {
   "name": "@dropinnodex/server",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Server-side SDK for dropin-activity — mint HS256 user tokens offline, and manage users, feeds, and webhooks from your backend. Node only.",
   "keywords": [
     "dropin",

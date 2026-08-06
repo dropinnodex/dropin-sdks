@@ -8,11 +8,14 @@ const dropin = new DropInServer({
 
 interface FetchCallOpts { method: string; headers: Record<string, string>; body?: string }
 function mockFetchOnce(res: { ok?: boolean; status?: number; json?: unknown; text?: string }) {
+  // text defaults to the SERIALISED json, because that is what a real Response does —
+  // body text and .json() are the same bytes. Defaulting it to '' let the SDK's
+  // empty-body handling look correct in tests while failing against a real server.
   const fn = vi.fn().mockResolvedValue({
     ok: res.ok ?? true,
     status: res.status ?? 200,
     json: async () => res.json,
-    text: async () => res.text ?? '',
+    text: async () => res.text ?? (res.json !== undefined ? JSON.stringify(res.json) : ''),
   })
   vi.stubGlobal('fetch', fn)
   return fn
@@ -149,6 +152,22 @@ describe('HTTP helpers', () => {
   it('throws with the status and body on a non-2xx response', async () => {
     mockFetchOnce({ ok: false, status: 403, text: 'forbidden' })
     await expect(dropin.upsertUser({ id: 'x' })).rejects.toThrow(/403 forbidden/)
+  })
+
+  it('treats ANY empty success body as undefined, not just a 204', async () => {
+    // POST /v1/feeds/:g/:id/follows answers 201 with NO body (docs/api/v1.yaml:490), and
+    // the real undici throws "Unexpected end of JSON input" on res.json() of an empty
+    // body — mockFetchOnce's json() resolves undefined instead, which is why every
+    // existing test passed while `seed.ts` died on its first follow. Model the real
+    // failure here.
+    const fn = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 201,
+      json: async () => { throw new SyntaxError('Unexpected end of JSON input') },
+      text: async () => '',
+    })
+    vi.stubGlobal('fetch', fn)
+    await expect(dropin.feed('flat', 'explore').follow('user', 'maya')).resolves.toBeUndefined()
   })
 
   it('treats a 204 as an empty success and sends no body', async () => {

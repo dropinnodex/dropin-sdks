@@ -1,5 +1,40 @@
 # @dropinnodex/react
 
+## 0.6.0
+
+### Minor Changes
+
+- 97e8a67: `useFeed` (and `useTimeline` / `useUserFeed`) is now safe to drive from an
+  IntersectionObserver, not just a "Load more" button. Everything below is additive — the
+  existing return shape is unchanged.
+
+  - **`loadNext` no longer double-fetches.** It was guarded only against end-of-feed
+    (`next === null`), and `next` updates when the response lands — so two calls before the
+    first resolved both sent the same cursor and both appended. A button barely reaches
+    this; a sentinel firing on intersect and again on reflow reaches it every scroll. A
+    call while a page is in flight is now a no-op.
+  - **Pages merge deduped by id.** The merge was a bare `[...prev, ...page.results]`, so an
+    overlapping page (a row inserted ahead of the cursor, or an at-least-once fan-out
+    replay) produced duplicate React keys.
+  - **`isLoadingInitial` / `isLoadingMore`** split out of `isLoading`, which stays as their
+    union. Gate a full-page spinner on `isLoadingInitial`: the shared flag is also true
+    during `loadNext`, so a list gated on it unmounts its own scroll sentinel mid-fetch and
+    scrolling stalls permanently.
+  - **`canLoadMore`** — `hasNext` folded together with "not in flight" and "not errored".
+    Bind the sentinel to this. A failed page leaves the cursor unchanged, so an unguarded
+    sentinel re-issues the identical failed request for as long as it stays intersecting.
+    `loadNext` now no-ops while `error` is set; **`retry()`** clears the error and re-issues
+    that page.
+  - **`pageSize`** option (default 20) replaces the hardcoded per-request limit on every
+    read the hook makes. 20 rows is a single screen on a desktop viewport, so scroll paid a
+    round trip per screen. Note `newCount` saturates at this value.
+  - **`useInfiniteFeed`** — `useFeed` with the scroll wiring attached: a `sentinelRef`
+    callback ref for the web (`rootMargin` option, default `'600px'`) and an
+    `onEndReached` for React Native's `FlatList`. It re-checks after every commit, because
+    the sentinel does not move when a page lands — without that, one scroll gesture loads
+    exactly one page. Inert where there is no `IntersectionObserver`, so the same component
+    can be shared with React Native.
+
 ## 0.5.0
 
 ### Minor Changes

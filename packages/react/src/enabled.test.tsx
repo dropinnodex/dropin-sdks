@@ -67,15 +67,20 @@ describe('DropInProvider enabled={false}', () => {
     expect(result.current.newCount).toBe(0)
     expect(result.current.promoted).toEqual([])
     expect(result.current.items).toEqual([])
+    // An inert feed can never load more, so a mounted sentinel stays quiet.
+    expect(result.current.canLoadMore).toBe(false)
+    expect(result.current.isLoadingInitial).toBe(false)
+    expect(result.current.isLoadingMore).toBe(false)
     // Shape keys, not just values — the inert return must mirror the live one (plus `enabled`).
     expect(Object.keys(result.current).sort()).toEqual([
-      'activities', 'addActivity', 'checkNew', 'enabled', 'error', 'hasNext',
-      'isLoading', 'items', 'loadNext', 'newCount', 'promoted', 'refresh',
-      'showNew', 'trackPromotedClick',
+      'activities', 'addActivity', 'canLoadMore', 'checkNew', 'enabled', 'error', 'hasNext',
+      'isLoading', 'isLoadingInitial', 'isLoadingMore', 'items', 'loadNext', 'newCount',
+      'promoted', 'refresh', 'retry', 'showNew', 'trackPromotedClick',
     ])
     // Its action/read fns are no-ops resolving undefined.
     await act(async () => {
       await expect(result.current.loadNext()).resolves.toBeUndefined()
+      await expect(result.current.retry()).resolves.toBeUndefined()
       await expect(result.current.refresh()).resolves.toBeUndefined()
       await expect(result.current.checkNew()).resolves.toBeUndefined()
       await expect(

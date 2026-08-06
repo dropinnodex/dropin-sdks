@@ -105,6 +105,75 @@ function Timeline() {
 }
 ```
 
+## Pagination & infinite scroll
+
+`useFeed` tracks the keyset cursor for you. `loadNext()` appends the next page;
+`pageSize` (default 20) sets the rows per request for every read the hook makes.
+
+```tsx
+const { activities, loadNext, canLoadMore, isLoadingMore } = useFeed('timeline', uid)
+
+{canLoadMore && (
+  <button onClick={() => void loadNext()} disabled={isLoadingMore}>Load more</button>
+)}
+```
+
+`useInfiniteFeed` is the same hook with the scroll wiring attached — put `sentinelRef` on
+a trailing element and pages load as it comes into view. `rootMargin` (default `'600px'`)
+is how far ahead of the viewport to start.
+
+```tsx
+import { useInfiniteFeed } from '@dropinnodex/react'
+
+function Timeline({ uid }) {
+  const { activities, sentinelRef, isLoadingInitial, isLoadingMore, error, retry } =
+    useInfiniteFeed('timeline', uid, { pageSize: 40 })
+
+  // isLoadingInitial, NOT isLoading — see below.
+  if (isLoadingInitial && activities.length === 0) return <FullPageLoading />
+
+  return (
+    <>
+      {activities.map((a) => <Post key={a.id} activity={a} />)}
+      {error && <button onClick={() => void retry()}>Try again</button>}
+      <div ref={sentinelRef}>{isLoadingMore && <Spinner />}</div>
+    </>
+  )
+}
+```
+
+An IntersectionObserver fires on intersect **and again on every reflow**, so three things
+that a "Load more" button barely reaches become the normal path. All three are handled,
+including for a hand-rolled sentinel — as long as you use the right flags:
+
+- **Gate the list on `isLoadingInitial`, never `isLoading`.** `isLoading` is the union of
+  initial and next-page loading. A list gated on it swaps itself for a spinner while page
+  2 is in flight, unmounting your sentinel — scrolling then stalls for good and the reader
+  loses their position. `isLoadingInitial` covers only the reads that replace the list
+  (first load, feed switch, `refresh()`); `isLoadingMore` covers `loadNext`.
+- **Bind the sentinel to `canLoadMore`, not `hasNext`.** `canLoadMore` also folds in "a
+  page is already in flight" and "the last page failed". A failed page leaves the cursor
+  unchanged, so retrying on `hasNext` alone re-issues the identical failed request for as
+  long as the sentinel stays in view. `loadNext()` is a no-op while `error` is set;
+  `retry()` is the deliberate way back in.
+- **Duplicates are handled.** Pages merge deduped by id, and a second `loadNext()` while
+  one is in flight is dropped — so an overlapping page can't produce duplicate React keys.
+
+On React Native, `FlatList` does the observing. `sentinelRef` is inert where there is no
+`IntersectionObserver`, so the same component works on both.
+
+```tsx
+const { activities, onEndReached, isLoadingMore } = useInfiniteFeed('timeline', uid)
+
+<FlatList
+  data={activities}
+  keyExtractor={(a) => a.id}
+  onEndReached={onEndReached}
+  onEndReachedThreshold={0.5}
+  ListFooterComponent={isLoadingMore ? <Spinner /> : null}
+/>
+```
+
 ## Timeline & follows
 
 Two feed kinds make a social timeline:

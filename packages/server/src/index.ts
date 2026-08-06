@@ -203,7 +203,12 @@ export class DropInServer {
       const text = await res.text()
       throw new Error(`dropin ${method} ${path} failed: ${res.status} ${text}`)
     }
-    return res.status === 204 ? (undefined as T) : ((await res.json()) as T)
+    // ANY empty success body → undefined, not just a 204: `POST …/follows` answers 201
+    // with no content (docs/api/v1.yaml), and res.json() of an empty body throws
+    // "Unexpected end of JSON input". Read the text once, parse only if there is any.
+    // Mirrors @dropinnodex/client, which already handles it this way.
+    const text = await res.text()
+    return (text ? JSON.parse(text) : undefined) as T
   }
 
   upsertUser(
