@@ -1,5 +1,31 @@
 # @dropinnodex/server
 
+## 0.9.0
+
+### Minor Changes
+
+- 9398eab: `PATCH /v1/activities/:id` now accepts `refs`, a top-level field (not a `custom.`
+  path) that replaces an activity's `refs` array wholesale — `refs: []` clears it,
+  and a body carrying only `refs` is a valid patch on its own. This is the backfill
+  path for an activity posted before objects existed: it can adopt refs after the
+  fact without the delete-and-repost that would otherwise burn its `foreign_id`
+  identity, re-fan-out to every follower, and jump it to the top of every timeline.
+
+  - `PatchBody.refs?: string[]` (client, re-exported by server and react)
+  - `dropin.activities.patch(id, { refs: [...] })` (server)
+  - `client.feed(group, id).updateActivity(id, { refs: [...] })` (client)
+  - `useFeed().updateActivity(id, { refs: [...] })` (react) — `refs` is deliberately
+    NOT applied by the optimistic step (unlike `set`/`unset`): what renders is the
+    resolved object's `custom` in `objects`, which this hook has no local copy of
+    for a ref that just started pointing at it. `activity.refs` itself still
+    updates the moment the patch call's network response lands; the newly
+    referenced object resolves into `objects` on the next feed read.
+
+### Patch Changes
+
+- Updated dependencies [9398eab]
+  - @dropinnodex/client@0.5.0
+
 ## 0.8.0
 
 ### Minor Changes

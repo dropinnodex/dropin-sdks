@@ -540,6 +540,33 @@ describe('objects and patch', () => {
     ])
   })
 
+  it('patches an activity with refs — the backfill path, no custom set/unset needed', async () => {
+    const { server, calls } = recordingServer()
+    await server.activities.patch('a1', { refs: ['session:1234'] })
+    expect(calls).toEqual([
+      { method: 'PATCH', path: '/v1/activities/a1', body: { refs: ['session:1234'] } },
+    ])
+  })
+
+  it('patches an activity with refs alongside a custom set — refs reaches the wire in the same body', async () => {
+    const { server, calls } = recordingServer()
+    await server.activities.patch('a1', { set: { 'custom.title': 'fixed' }, refs: ['session:1234'] })
+    expect(calls).toEqual([
+      {
+        method: 'PATCH', path: '/v1/activities/a1',
+        body: { set: { 'custom.title': 'fixed' }, refs: ['session:1234'] },
+      },
+    ])
+  })
+
+  it('patches an activity with refs: [] to clear every ref', async () => {
+    const { server, calls } = recordingServer()
+    await server.activities.patch('a1', { refs: [] })
+    expect(calls).toEqual([
+      { method: 'PATCH', path: '/v1/activities/a1', body: { refs: [] } },
+    ])
+  })
+
   it('bulk-upserts objects', async () => {
     const { server, calls } = recordingServer()
     const objects = [{ type: 'session', id: '1', custom: { spots_left: 2 } }]

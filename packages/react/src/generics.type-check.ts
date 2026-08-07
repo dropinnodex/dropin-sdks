@@ -97,6 +97,11 @@ async function _typecheckUpdateActivity() {
   const editedAt: string | null | undefined = updated?.edited_at
   const refs: string[] | undefined = updated?.refs
 
+  // refs is a legal PatchBody field on its own — no `set`/`unset` required — and
+  // combines with them in one call (activity-refs-patch amendment).
+  await feed.updateActivity('a1', { refs: ['session:1234'] })
+  await feed.updateActivity('a1', { set: { 'custom.title': 'x' }, refs: [] })
+
   void title
   void editedAt
   void refs

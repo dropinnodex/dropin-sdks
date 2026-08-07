@@ -29,10 +29,21 @@ export interface DropInObject<TCustom = Record<string, unknown>> {
   updated_at: string
 }
 
-/** A patch-style update. Every path starts with `custom.`; `unset` applies after `set`. */
+/**
+ * A patch-style update. Every `set`/`unset` path starts with `custom.`; `unset`
+ * applies after `set`. At least one of `set`/`unset`/`refs` must be present.
+ */
 export interface PatchBody {
   set?: Record<string, unknown>
   unset?: string[]
+  /**
+   * `feed(group, id).updateActivity()` only — ignored by `objects.patch()`, since
+   * objects have no `refs` of their own. Replaces the activity's `refs` array
+   * wholesale (not merged): each entry is `type:id`, max 4, no duplicates. `[]`
+   * clears every ref. This is how an activity posted before objects existed adopts
+   * them, without the delete-and-repost this feature exists to avoid.
+   */
+  refs?: string[]
 }
 
 export interface Page<T> {
@@ -312,7 +323,13 @@ export class DropInClient {
       // enforces authority = origin_feed, so removing from a feed you don't own is a 403.
       removeActivity: async (activityId: string, opts: RequestOptions = {}) =>
         this.call<void>('DELETE', `/v1/activities/${pathSegment(activityId)}`, undefined, opts),
-      /** Patch an activity's `custom`. Permitted on your own activities only. */
+      /**
+       * Patch an activity's `custom` and/or `refs`. Permitted on your own activities
+       * only. `body.refs`, when present, replaces the refs array wholesale (`[]`
+       * clears it) — the backfill path for attaching objects to an activity posted
+       * before they existed, without the delete-and-repost that would otherwise burn
+       * its `foreign_id` and re-fan-out to every follower.
+       */
       updateActivity: async <TCustom = Record<string, unknown>>(
         activityId: string, body: PatchBody, opts: RequestOptions = {},
       ) => this.call<Activity<TCustom>>(

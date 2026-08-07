@@ -210,10 +210,16 @@ and why delete-and-repost is the wrong tool. From this package:
 const session = await client.objects.get('session', '1234')
 session.custom   // whatever your backend put there
 
-// Patch YOUR OWN activity's `custom` — a typo, a corrected caption. Every path
-// starts with `custom.`; `unset` is applied after `set`.
+// Patch YOUR OWN activity's `custom` — a typo, a corrected caption. Every
+// set/unset path starts with `custom.`; `unset` is applied after `set`.
 await client.feed('user', 'alice').updateActivity(activityId, {
   set: { 'custom.text': 'Corrected caption' },
+})
+
+// refs is patchable too, as a top-level field — replaces wholesale, `[]` clears
+// it. This is how an activity posted before objects existed adopts one.
+await client.feed('user', 'alice').updateActivity(activityId, {
+  refs: ['session:1234'],
 })
 ```
 

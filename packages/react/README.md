@@ -390,13 +390,29 @@ types the sidecar as optional — the server omits the key when nothing on the p
 carries a ref — but `useFeed` normalizes that to an empty object, so you can index
 straight into it without a null check.
 
-`updateActivity(activityId, { set, unset })` patches ONE activity's own `custom` —
-optimistic, with rollback and the same reject-after-rollback / `onError` contract
-as `react`/`follow` (see below). Every path starts with `custom.`; identity fields
-(`actor`, `verb`, `object`, `target`, `time`, `foreign_id`) are never patchable.
+`updateActivity(activityId, { set, unset, refs })` patches ONE activity's own
+`custom` and/or `refs` — optimistic, with rollback and the same
+reject-after-rollback / `onError` contract as `react`/`follow` (see below). Every
+`set`/`unset` path starts with `custom.`; identity fields (`actor`, `verb`,
+`object`, `target`, `time`, `foreign_id`) are never patchable.
 
 ```tsx
 await updateActivity(activity.id, { set: { 'custom.text': 'Corrected caption' } })
+```
+
+`refs`, when present, replaces the activity's refs array wholesale (`[]` clears
+it) — the backfill path for pointing an already-posted activity at an object,
+without delete-and-repost. It's the one field `updateActivity` does NOT apply
+optimistically: what renders is the resolved object's `custom` in `objects`, and
+this hook has no local copy of an object a ref just started pointing at (the
+patch response is the Activity, not a sidecar). `activity.refs` itself still
+updates the moment the network call resolves — the optimistic step only skips
+echoing it a few hundred milliseconds early. The newly-referenced object then
+resolves into `objects` on the next feed read (mount, `refresh()`, `loadNext()`,
+or `checkNew()`), same as any other object update.
+
+```tsx
+await updateActivity(activity.id, { refs: ['session:1234'] })
 ```
 
 Objects themselves are server-write-only — there's no `useObject`/write hook here

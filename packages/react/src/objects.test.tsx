@@ -198,6 +198,55 @@ describe('useFeed updateActivity', () => {
     expect(client.feed).not.toHaveBeenCalled()
   })
 
+  describe('refs', () => {
+    it('is NOT applied optimistically — activity.refs stays put until the server responds', async () => {
+      let resolveUpdate!: (v: Activity) => void
+      const updateActivity = vi.fn(() => new Promise<Activity>((r) => { resolveUpdate = r }))
+      const get = vi.fn(async () => ({ results: [activity('a1', ['session:1'])], next: null }))
+      const client = makeClient({ feed: vi.fn(() => ({ get, updateActivity })) })
+      const { result } = renderHook(() => useFeed('timeline', 'alice'), { wrapper: wrapper(client) })
+      await waitFor(() => expect(result.current.isLoading).toBe(false))
+
+      let p!: Promise<Activity | undefined>
+      act(() => { p = result.current.updateActivity('a1', { refs: ['session:2'] }) })
+      // Unlike `custom`, refs is deliberately not echoed by the optimistic step — see
+      // applyPatch's doc comment. The old refs are still what's rendered right now.
+      expect(result.current.activities[0]!.refs).toEqual(['session:1'])
+
+      const serverActivity = activity('a1', ['session:2'])
+      await act(async () => { resolveUpdate(serverActivity); await p })
+      // The server's response replaces the whole activity, refs included — no extra
+      // code needed for this to land the moment the network call resolves.
+      expect(result.current.activities[0]!.refs).toEqual(['session:2'])
+      expect(updateActivity).toHaveBeenCalledWith('a1', { refs: ['session:2'] })
+    })
+
+    it('accepts a refs-only body with no set/unset', async () => {
+      const updateActivity = vi.fn(async (id: string) => activity(id, ['session:9']))
+      const get = vi.fn(async () => ({ results: [activity('a1')], next: null }))
+      const client = makeClient({ feed: vi.fn(() => ({ get, updateActivity })) })
+      const { result } = renderHook(() => useFeed('timeline', 'alice'), { wrapper: wrapper(client) })
+      await waitFor(() => expect(result.current.isLoading).toBe(false))
+
+      const resolved = await act(() => result.current.updateActivity('a1', { refs: ['session:9'] }))
+      expect(resolved?.refs).toEqual(['session:9'])
+      expect(result.current.activities[0]!.refs).toEqual(['session:9'])
+    })
+
+    it('a failing refs-only patch rejects with nothing to roll back (refs was never applied optimistically)', async () => {
+      const updateActivity = vi.fn(async () => { throw new Error('boom') })
+      const get = vi.fn(async () => ({ results: [activity('a1', ['session:1'])], next: null }))
+      const client = makeClient({ feed: vi.fn(() => ({ get, updateActivity })) })
+      const { result } = renderHook(() => useFeed('timeline', 'alice'), { wrapper: wrapper(client) })
+      await waitFor(() => expect(result.current.isLoading).toBe(false))
+
+      await act(async () => {
+        await expect(result.current.updateActivity('a1', { refs: ['session:2'] })).rejects.toThrow('boom')
+      })
+      expect(result.current.activities[0]!.refs).toEqual(['session:1'])
+    })
+  })
+
   it('a refresh() landing mid-flight is not discarded by a later-failing patch (scoped rollback)', async () => {
     let rejectUpdate!: (e: Error) => void
     const updateActivity = vi.fn(() => new Promise<Activity>((_res, rej) => { rejectUpdate = rej }))

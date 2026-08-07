@@ -70,11 +70,16 @@ await dropin.feed('user', 'alice').addActivity({
 
 // Patch ONE activity's own `custom` — a typo, a corrected caption.
 await dropin.activities.patch(activityId, { set: { 'custom.text': 'Corrected caption' } })
+
+// refs is patchable too — the backfill path for an activity posted before objects
+// existed. It's a top-level field (not `custom.`-dotted) and replaces wholesale;
+// `refs: []` clears every ref. Activity patch only — objects ignore it.
+await dropin.activities.patch(activityId, { refs: ['session:1234'] })
 ```
 
 `custom` is **required** on `upsert`/`batch.objects` — it replaces the object's
 `custom` wholesale, so omitting it would wipe the object; the server rejects the
-call instead. Every patch path (objects and activities) must start with
+call instead. Every `set`/`unset` path (objects and activities) must start with
 `custom.`; `unset` is applied after `set`.
 
 ## Cancellation

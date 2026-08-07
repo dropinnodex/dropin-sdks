@@ -493,6 +493,43 @@ describe('updateActivity', () => {
     await client(async () => 'tok').feed('user', 'alice').updateActivity('a/1', { unset: ['custom.text'] })
     expect(lastUrl()).toBe('http://api.test/v1/activities/a%2F1')
   })
+
+  it('sends refs on its own — the backfill path, no custom set/unset needed', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, {
+      id: 'a1', actor: 'user:alice', verb: 'post', object: 'w:1', target: null, foreign_id: null,
+      time: '2026-08-07T00:00:00Z', custom: {}, origin_feed: 'user:alice',
+      reaction_counts: {}, actor_user: null, refs: ['session:1234'], edited_at: '2026-08-07T00:00:01Z',
+    }))
+    const res = await client(async () => 'tok')
+      .feed('user', 'alice')
+      .updateActivity('a1', { refs: ['session:1234'] })
+    expect(JSON.parse(callAt(0)[1].body!)).toEqual({ refs: ['session:1234'] })
+    expect(res.refs).toEqual(['session:1234'])
+  })
+
+  it('sends refs alongside a custom set in one body', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, {
+      id: 'a1', actor: 'user:alice', verb: 'post', object: 'w:1', target: null, foreign_id: null,
+      time: '2026-08-07T00:00:00Z', custom: { text: 'x' }, origin_feed: 'user:alice',
+      reaction_counts: {}, actor_user: null, refs: ['session:1234'], edited_at: '2026-08-07T00:00:01Z',
+    }))
+    await client(async () => 'tok')
+      .feed('user', 'alice')
+      .updateActivity('a1', { set: { 'custom.text': 'x' }, refs: ['session:1234'] })
+    expect(JSON.parse(callAt(0)[1].body!)).toEqual({
+      set: { 'custom.text': 'x' }, refs: ['session:1234'],
+    })
+  })
+
+  it('sends refs: [] to clear every ref', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, {
+      id: 'a1', actor: 'user:alice', verb: 'post', object: 'w:1', target: null, foreign_id: null,
+      time: '2026-08-07T00:00:00Z', custom: {}, origin_feed: 'user:alice',
+      reaction_counts: {}, actor_user: null, refs: [], edited_at: '2026-08-07T00:00:01Z',
+    }))
+    await client(async () => 'tok').feed('user', 'alice').updateActivity('a1', { refs: [] })
+    expect(JSON.parse(callAt(0)[1].body!)).toEqual({ refs: [] })
+  })
 })
 
 describe('feed read: objects sidecar', () => {

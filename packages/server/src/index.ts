@@ -339,6 +339,15 @@ export class DropInServer {
    * Activity-level edits. Use this to fix ONE activity's own body — a typo, a corrected
    * caption. For data shared across many activities, use `objects` instead: patching each
    * activity is N writes where an object update is one.
+   *
+   * `body.refs` (optional, top-level — not a `custom.` path) replaces the activity's
+   * refs array wholesale, including `refs: []` to clear it. This is the backfill path
+   * for an activity written before objects existed: it can adopt refs after the fact
+   * without the delete-and-repost that would otherwise burn its `foreign_id` and
+   * re-fan-out to every follower.
+   *
+   * @example
+   * await dropin.activities.patch('a1', { refs: ['session:1234'] })
    */
   readonly activities = {
     patch: async <TCustom = Record<string, unknown>>(

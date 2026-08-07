@@ -235,6 +235,26 @@ function unsetAtPath(obj: Record<string, unknown>, segments: string[]): Record<s
  * matching the server's own order. Any path containing a forbidden segment (see
  * `FORBIDDEN_SEGMENT` above) anywhere in it is skipped entirely, for both `set` and
  * `unset`, rather than partially applied.
+ *
+ * Deliberately does NOT touch `body.refs`, even though `updateActivity` accepts it
+ * (activity-refs-patch amendment, mutable-feed-data spec). `custom` values are
+ * self-contained — the new value IS the thing that renders, so echoing it locally
+ * before the network round trip is a real, visible improvement. `refs` is not: what
+ * actually renders is the RESOLVED object's `custom`, fetched separately into
+ * `useFeed`'s `objects` sidecar, and this hook has no local data for an object a ref
+ * just started pointing at — `PATCH /v1/activities/:id` returns the patched Activity,
+ * not a sidecar. Optimistically flipping `.refs` here would not make anything new
+ * appear; it would only make `resolveRefs` hit its already-documented "dangling ref"
+ * fallback (spec §8: absent from the map, not an error — render from `custom`) one
+ * round trip early, while adding a second, differently-shaped rollback path (`refs`
+ * replaces wholesale; it cannot reuse the per-path `pathOwnerRef`/`priorValuesFor`
+ * machinery below) for no visible gain. `updateActivity`'s existing success handler —
+ * unconditionally replacing the local activity with the server's returned copy —
+ * already picks up the new `refs` the moment this very call resolves, which is as
+ * fresh as this hook can honestly get without fetching the newly-referenced object
+ * too. The next feed read (mount, `refresh()`, `loadNext()`, or `checkNew()`)
+ * resolves it into `objects`, same as any other object update (spec §2: freshness is
+ * pull, not push, here).
  */
 export function applyPatch<TCustom = Record<string, unknown>>(
   activity: Activity<TCustom>,
@@ -701,6 +721,13 @@ export function useFeed<TCustom = Record<string, unknown>>(
    *
    * A no-op (activities unchanged) if `activityId` isn't in the currently-loaded list —
    * the network call still fires, since the activity may simply be off-page.
+   *
+   * `body.refs`, when present, replaces the activity's refs wholesale (not merged) —
+   * the backfill path for attaching objects to an activity posted before they existed.
+   * Unlike `set`/`unset`, it is NOT applied by the optimistic step (see `applyPatch`'s
+   * doc comment for why); it lands as soon as this call's network response replaces
+   * the local activity, and the objects it newly points at resolve on the next feed
+   * read, same as any other object update.
    *
    * @throws The network error after the optimistic patch has been rolled back (no
    * `onError` supplied).
