@@ -218,7 +218,11 @@ function unsetAtPath(obj: Record<string, unknown>, segments: string[]): Record<s
   const [head, ...rest] = segments
   if (head === undefined || !(head in obj)) return obj
   if (rest.length === 0) {
-    const { [head]: _removed, ...remainder } = obj
+    // `delete` on a fresh shallow copy rather than destructure-and-drop: the destructuring
+    // form needs a binding it never reads, which the mirror repo's eslint rejects even
+    // though this one allows a leading underscore. Same result, no unused name.
+    const remainder = { ...obj }
+    delete remainder[head]
     return remainder
   }
   const current = obj[head]
