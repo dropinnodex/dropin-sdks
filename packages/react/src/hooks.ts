@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type {
-  Activity, FeedPage, Follow, Notification, Page, PromotedActivity, Reaction, Suggestion,
+  Activity, DropInObject, FeedPage, Follow, Notification, Page, PatchBody, PromotedActivity,
+  Reaction, Suggestion,
 } from '@dropinnodex/client'
 import { useDropInContext, useDropInClientOrNull, type CacheEntry } from './provider.js'
 import { useLiveTicks } from './use-live.js'
@@ -12,6 +13,7 @@ export type OptimisticOnErrorCtx =
   | { hook: 'useFollow'; action: 'follow' | 'unfollow';
       source: { group: string; id: string }; target: { group: string; id: string } }
   | { hook: 'useNotifications'; action: 'markSeen' | 'markRead'; ids: string[] | null }
+  | { hook: 'useFeed'; action: 'updateActivity'; activityId: string }
 
 /** Opt-in error sink for an optimistic write. When provided (per-call or via
  *  `<DropInProvider onError>`), the action rolls back AND resolves to `undefined` —
@@ -123,6 +125,230 @@ export function placePromoted<TCustom = Record<string, unknown>>(
 }
 
 /**
+ * Resolve an activity's refs against a feed page's `objects` sidecar. Pure — it fetches
+ * nothing. Refs with no stored object are SKIPPED, not returned as holes: an object may
+ * legitimately not exist yet (the tenant posted before storing it), and a hole in the
+ * array would push that decision onto every caller.
+ */
+export function resolveRefs<TCustom = Record<string, unknown>>(
+  activity: Activity<TCustom>,
+  objects: Record<string, DropInObject<TCustom>> | undefined,
+): DropInObject<TCustom>[] {
+  if (objects === undefined) return []
+  const out: DropInObject<TCustom>[] = []
+  for (const ref of activity.refs) {
+    const obj = objects[ref]
+    if (obj !== undefined) out.push(obj)
+  }
+  return out
+}
+
+/**
+ * PROTOTYPE POLLUTION GUARD — defense in depth, do not remove.
+ *
+ * `custom.__proto__.x` matches patchBodySchema's `^custom(\.[^.]+)+$` at the HTTP
+ * boundary, so it reaches this far. It does NOT reach the server unrejected, though: as
+ * of `c5d756a` the server folds a patch's paths into a real nested JS object (not a
+ * Postgres `text[]` anymore — that was true before that rewrite, not now) via its own
+ * `setNested`, which rejects `__proto__`/`constructor`/`prototype` at any segment
+ * position and returns 400 (since `8ae05a8`). So this is no longer "harmless server-side,
+ * guarded here defensively" — the server actively rejects it too, independently.
+ *
+ * This client-side guard is still necessary regardless: `applyPatch` runs the optimistic
+ * update LOCALLY, before any network round trip, so a request the server will eventually
+ * 400 would otherwise still walk these segments over a real JavaScript object here first.
+ * That sounds like the same hazard the server closed — but it isn't exploitable as
+ * written: what actually stops pollution is that `setAtPath`/`unsetAtPath` below build
+ * every level via `{ ...obj, [head]: value }`, a COMPUTED property write. A computed key
+ * equal to `"__proto__"` creates an ordinary own property named `"__proto__"` on the new
+ * object — it does NOT invoke `Object.prototype.__proto__`'s setter, which only fires for
+ * a literal `obj.__proto__ = x` or `obj["__proto__"] = x` MUTATION of an *existing*
+ * object. Spread-into-a-new-object is not that. (Verified: disabling this guard entirely
+ * still does not pollute `Object.prototype` — see objects.test.tsx.)
+ *
+ * So this Set is not what closes the hole; immutability is. This guard exists to stop a
+ * confusing, inert `"__proto__"`/`"constructor"`/`"prototype"` OWN PROPERTY from landing
+ * in `custom` during the optimistic window and being re-serialized back to the server on
+ * a LATER write — which is a correctness/hygiene problem, not a pollution one.
+ *
+ * THE CATCH: if `setAtPath`/`unsetAtPath` are ever "optimized" to mutate in place
+ * (`obj[head] = value` on the existing object, skipping the spread) instead of returning
+ * a new one, THAT is the moment this guard stops being optional and becomes the only
+ * thing standing between a wire-supplied path and `Object.prototype`. Whoever makes that
+ * change needs to see this warning, not a comment that already (wrongly) told them the
+ * guard had it covered.
+ */
+const FORBIDDEN_SEGMENT = new Set(['__proto__', 'constructor', 'prototype'])
+
+/**
+ * Split a `custom.a.b` path into its walk segments (`['a', 'b']`), or `null` when the
+ * path is malformed OR any segment — at ANY position, not just the last — is one of
+ * `__proto__`/`constructor`/`prototype`. A guard that only checks the terminal segment is
+ * a common and useless half-fix: `custom.a.__proto__.b` pollutes just as effectively via
+ * an intermediate assignment.
+ *
+ * A forbidden path is silently dropped rather than thrown: the server rejects the same
+ * path too (now, independently — see the guard comment above), so the optimistic window
+ * simply never diverges from what will happen for real. Throwing would turn a security
+ * guard into an availability bug for a caller who forwards attacker input unchecked.
+ */
+function safeSegments(path: string): string[] | null {
+  const parts = path.split('.')
+  if (parts.length < 2 || parts[0] !== 'custom') return null
+  const segments = parts.slice(1)
+  return segments.some((s) => FORBIDDEN_SEGMENT.has(s)) ? null : segments
+}
+
+/** Immutably set `segments` on `obj` to `value`, building intermediate objects with
+ *  spread. Segments have already passed `safeSegments` by the time this runs. */
+function setAtPath(obj: Record<string, unknown>, segments: string[], value: unknown): Record<string, unknown> {
+  const [head, ...rest] = segments
+  if (head === undefined) return obj
+  if (rest.length === 0) return { ...obj, [head]: value }
+  const current = obj[head]
+  const child = typeof current === 'object' && current !== null && !Array.isArray(current)
+    ? current as Record<string, unknown>
+    : {}
+  return { ...obj, [head]: setAtPath(child, rest, value) }
+}
+
+/** Immutable counterpart to `setAtPath` for `unset`. A path through a non-object (or a
+ *  missing key) is a no-op rather than an error — unsetting something already absent. */
+function unsetAtPath(obj: Record<string, unknown>, segments: string[]): Record<string, unknown> {
+  const [head, ...rest] = segments
+  if (head === undefined || !(head in obj)) return obj
+  if (rest.length === 0) {
+    const { [head]: _removed, ...remainder } = obj
+    return remainder
+  }
+  const current = obj[head]
+  if (typeof current !== 'object' || current === null || Array.isArray(current)) return obj
+  return { ...obj, [head]: unsetAtPath(current as Record<string, unknown>, rest) }
+}
+
+/**
+ * Apply a `PatchBody` to an activity's `custom`, immutably — `set` first, then `unset`,
+ * matching the server's own order. Any path containing a forbidden segment (see
+ * `FORBIDDEN_SEGMENT` above) anywhere in it is skipped entirely, for both `set` and
+ * `unset`, rather than partially applied.
+ */
+export function applyPatch<TCustom = Record<string, unknown>>(
+  activity: Activity<TCustom>,
+  body: PatchBody,
+): Activity<TCustom> {
+  let custom: Record<string, unknown> = { ...(activity.custom as unknown as Record<string, unknown>) }
+  for (const [path, value] of Object.entries(body.set ?? {})) {
+    const segments = safeSegments(path)
+    if (segments === null) continue
+    custom = setAtPath(custom, segments, value)
+  }
+  for (const path of body.unset ?? []) {
+    const segments = safeSegments(path)
+    if (segments === null) continue
+    custom = unsetAtPath(custom, segments)
+  }
+  return { ...activity, custom: custom as TCustom }
+}
+
+/** Read the value already sitting at a `custom.a.b` path, so a failed patch can be
+ *  inverted later. `existed: false` covers both "the key was never set" and "the walk
+ *  hit a non-object along the way" — either way there is nothing to restore but absence. */
+function getAtPath(
+  obj: Record<string, unknown>,
+  segments: string[],
+): { existed: true; value: unknown } | { existed: false } {
+  let cur: unknown = obj
+  for (const seg of segments) {
+    if (typeof cur !== 'object' || cur === null || Array.isArray(cur) || !(seg in (cur as Record<string, unknown>))) {
+      return { existed: false }
+    }
+    cur = (cur as Record<string, unknown>)[seg]
+  }
+  return { existed: true, value: cur }
+}
+
+/** Snapshot, per path, the value `custom` holds right before a patch overwrites it —
+ *  the raw material for a scoped inverse (`inversePatchFor`) if that patch's network
+ *  call later fails. Forbidden paths (see `safeSegments`) are recorded as `existed:
+ *  false`; `applyPatch` already never touched them, so their "inverse" is a no-op. */
+function priorValuesFor(
+  custom: unknown,
+  paths: string[],
+): Map<string, { existed: true; value: unknown } | { existed: false }> {
+  const base = (custom ?? {}) as Record<string, unknown>
+  const out = new Map<string, { existed: true; value: unknown } | { existed: false }>()
+  for (const path of paths) {
+    const segments = safeSegments(path)
+    out.set(path, segments === null ? { existed: false } : getAtPath(base, segments))
+  }
+  return out
+}
+
+/** Build the `PatchBody` that undoes exactly `paths` against a `priorValuesFor` snapshot:
+ *  `set` back to whatever was there, or `unset` if nothing was. Restricting to `paths`
+ *  (rather than every path the snapshot knows about) is what lets a caller revert only
+ *  the subset of touched paths it still owns — see the ownership comment on
+ *  `pathOwnerRef` below. */
+function inversePatchFor(
+  prior: Map<string, { existed: true; value: unknown } | { existed: false }>,
+  paths: string[],
+): PatchBody {
+  const set: Record<string, unknown> = {}
+  const unset: string[] = []
+  for (const path of paths) {
+    const v = prior.get(path)
+    if (v === undefined) continue
+    if (v.existed) set[path] = v.value
+    else unset.push(path)
+  }
+  const body: PatchBody = {}
+  if (Object.keys(set).length > 0) body.set = set
+  if (unset.length > 0) body.unset = unset
+  return body
+}
+
+/**
+ * Ownership map for `updateActivity`'s optimistic-rollback tracking, keyed by activityId
+ * then path — NESTED, not a single `Map<string, symbol>` joined as `` `${activityId}::${path}` ``.
+ * A joined string key is not injective: activityId `"U"` + path `"custom.foo::bar"` and
+ * activityId `"U::custom.foo"` + path `"bar"` produce the identical key. Activity ids are
+ * server UUIDs so the first half of that can't happen from a real id, but `path` is
+ * whatever the caller's `custom` field names are — a `custom` field containing `::`
+ * reaches the collision through ordinary application code, no attacker required. A
+ * collision makes a failing call see `stillOwned === false` and skip a rollback it should
+ * have performed, leaving the UI showing a value the server rejected.
+ */
+type PathOwnerMap = Map<string, Map<string, symbol>>
+
+function setOwner(map: PathOwnerMap, activityId: string, path: string, token: symbol): void {
+  let inner = map.get(activityId)
+  if (inner === undefined) {
+    inner = new Map()
+    map.set(activityId, inner)
+  }
+  inner.set(path, token)
+}
+
+function isOwner(map: PathOwnerMap, activityId: string, path: string, token: symbol): boolean {
+  return map.get(activityId)?.get(path) === token
+}
+
+/** Remove ownership entries `token` still holds for `activityId`, once the call that
+ *  wrote them settles (success or failure) — keeps the map from growing unboundedly
+ *  across a long-lived feed instead of relying solely on the wholesale reset on feed
+ *  switch. Only removes entries still pointing at `token`; a path a newer overlapping
+ *  call has since taken over is left untouched, and an empty inner map is dropped too so
+ *  a feed with many distinct activities doesn't accumulate empty entries. */
+function releaseOwnedPaths(map: PathOwnerMap, activityId: string, paths: string[], token: symbol): void {
+  const inner = map.get(activityId)
+  if (inner === undefined) return
+  for (const path of paths) {
+    if (inner.get(path) === token) inner.delete(path)
+  }
+  if (inner.size === 0) map.delete(activityId)
+}
+
+/**
  * Loads a feed's first page and keeps it fresh, with optimistic `loadNext`/`addActivity`/
  * `refresh` helpers.
  *
@@ -209,7 +435,7 @@ export function useFeed<TCustom = Record<string, unknown>>(
   id: string,
   opts?: UseFeedOptions<TCustom>,
 ) {
-  const { client, cache } = useDropInContext()
+  const { client, cache, onError } = useDropInContext()
   const enabled = client !== null
   const feedKey = `${group}:${id}`
   const pageSize = opts?.pageSize ?? 20
@@ -219,8 +445,14 @@ export function useFeed<TCustom = Record<string, unknown>>(
   // provider/cache types.
   // `promoted` rides in the cache entry so a remount renders the same slots straight
   // away instead of losing them until the next uncursored read (later pages never
-  // carry a sidecar, so it cannot be recovered by paging).
-  type Entry = { activities: Activity<TCustom>[]; next: string | null; promoted?: PromotedActivity<TCustom>[] }
+  // carry a sidecar, so it cannot be recovered by paging). `objects` rides along for the
+  // same reason — a remount should render resolved refs instantly too.
+  type Entry = {
+    activities: Activity<TCustom>[]
+    next: string | null
+    promoted?: PromotedActivity<TCustom>[]
+    objects?: Record<string, DropInObject<TCustom>>
+  }
   // Seed from the provider cache: a remount or a second component on the
   // same feed renders instantly from the last fetch, then refreshes. A cache hit wins
   // over caller-supplied initialData — the cache means we already fetched fresher data
@@ -234,14 +466,23 @@ export function useFeed<TCustom = Record<string, unknown>>(
     ? {
         activities: opts.initialData.results,
         next: opts.initialData.next,
-        // An SSR-prefetched first page carries the sidecar too — keep it, or the
+        // An SSR-prefetched first page carries the sidecars too — keep them, or the
         // server-rendered markup and the first client render would disagree.
         ...('promoted' in opts.initialData ? { promoted: opts.initialData.promoted } : {}),
+        ...('objects' in opts.initialData ? { objects: opts.initialData.objects } : {}),
       }
     : undefined)
   const [activities, setActivities] = useState<Activity<TCustom>[]>(seed?.activities ?? [])
   const [next, setNext] = useState<string | null>(seed?.next ?? null)
   const [promoted, setPromoted] = useState<PromotedActivity<TCustom>[]>(seed?.promoted ?? [])
+  // The refs sidecar for the currently-shown page(s). `{}` — never `undefined` — when the
+  // server omits the key, so consumers can index straight in without a null check; the
+  // client type is `objects?: …` (server may not send it at all), but the hook picks one
+  // shape and commits to it. A full page load (mount/refresh) REPLACES this map (it
+  // re-resolves eligibility, same as `promoted`); `loadNext` MERGES a later page's objects
+  // in instead — a second page can introduce refs the first page didn't carry, and a
+  // blanket replace would blank already-rendered cards that resolved off page 1.
+  const [objects, setObjects] = useState<Record<string, DropInObject<TCustom>>>(seed?.objects ?? {})
   // Two loading flags, not one. `isLoadingInitial` covers the reads that REPLACE the list
   // (mount, feed switch, refresh) — the only ones a full-page spinner should gate.
   // `isLoadingMore` covers loadNext, which APPENDS: a list gated on the shared flag
@@ -265,8 +506,18 @@ export function useFeed<TCustom = Record<string, unknown>>(
   activitiesRef.current = activities
   const promotedRef = useRef(promoted)
   promotedRef.current = promoted
+  const objectsRef = useRef(objects)
+  objectsRef.current = objects
   const pendingRef = useRef(pending)
   pendingRef.current = pending
+  // Tracks, per activityId then path (see `PathOwnerMap` above for why it's nested rather
+  // than a single map joined on a delimiter), which in-flight updateActivity call most
+  // recently wrote that specific custom path optimistically. On failure, a call reverts
+  // ONLY paths it still owns (the map still points at its own token) — so two overlapping
+  // updateActivity calls that touch the same path never stomp each other: whichever
+  // wrote LAST keeps its value even if an EARLIER call is the one that fails. Entries are
+  // released (`releaseOwnedPaths`) once the call that wrote them settles.
+  const pathOwnerRef = useRef<PathOwnerMap>(new Map())
   // Tracks the live feedKey so an in-flight checkNew from a feed that's since been
   // switched away from (group/id changed while its fetch was in the air) can detect
   // it and drop its result instead of writing stale data into the new feed's state.
@@ -303,23 +554,48 @@ export function useFeed<TCustom = Record<string, unknown>>(
     // Publish SSR initialData to the shared cache so a sibling/remounted useFeed on the
     // same feed renders from it too (not just this instance), until the fetch lands.
     if (cache.get(feedKey) === undefined && seed !== undefined) cache.set(feedKey, seed as CacheEntry)
-    client.feed(group, id).get<TCustom>({ limit: pageSize }, { signal: ctrl.signal })
-      .then((page) => {
-        if (cancelled) return
-        // An uncursored read is the only thing that ever carries the sidecar; `?? []`
-        // so a server without the feature degrades to "nothing eligible", not undefined.
-        const side = page.promoted ?? []
-        setCache({ activities: page.results, next: page.next, promoted: side })
-        setActivities(page.results)
-        setNext(page.next)
-        setPromoted(side)
-      })
-      .catch((err: unknown) => { if (!cancelled && !isAbort(err)) setError(err as Error) })
-      .finally(() => { if (!cancelled) setLoadingInitial(false) })
+    // try/catch around the kickoff itself, not just `.catch()` on the resulting promise:
+    // `client.feed(group, id)` and `.get(...)` are both expected to reject rather than
+    // throw synchronously (every SDK error is a Promise rejection — see pathSegment() in
+    // @dropinnodex/client), but this hook's documented contract is that a feed read never
+    // crashes the component, only ever surfaces through `error`. Wrapping the kickoff is
+    // the same defense-in-depth every sibling hook's `load()` gets for free from being an
+    // `async` function with the whole body inside `try` — mirror that here rather than
+    // trust an invariant that lives in a different package.
+    try {
+      client.feed(group, id).get<TCustom>({ limit: pageSize }, { signal: ctrl.signal })
+        .then((page) => {
+          if (cancelled) return
+          // An uncursored read is the only thing that ever carries the sidecar; `?? []`
+          // so a server without the feature degrades to "nothing eligible", not undefined.
+          const side = page.promoted ?? []
+          const objSide = page.objects ?? {}
+          setCache({ activities: page.results, next: page.next, promoted: side, objects: objSide })
+          setActivities(page.results)
+          setNext(page.next)
+          setPromoted(side)
+          setObjects(objSide)
+        })
+        .catch((err: unknown) => { if (!cancelled && !isAbort(err)) setError(err as Error) })
+        .finally(() => { if (!cancelled) setLoadingInitial(false) })
+    } catch (err) {
+      if (!cancelled && !isAbort(err)) setError(err as Error)
+      if (!cancelled) setLoadingInitial(false)
+    }
     // abort() cancels the request itself; `cancelled` still guards the state writes, since
     // a response that already landed resolves regardless of the signal.
     return () => { cancelled = true; ctrl.abort() }
   }, [client, cache, feedKey, group, id, pageSize])
+
+  // Reset path-ownership tracking on a feed switch (or mount) only — NOT on every
+  // dependency of the mount effect above (which also includes `pageSize`). A `pageSize`
+  // change while an `updateActivity` call is in flight must not wipe the map: that call's
+  // token would no longer be found on failure, so its rollback would be silently skipped.
+  // A path-ownership token from a DIFFERENT feed is meaningless here (activity ids don't
+  // carry across feeds), so `feedKey` is the only dependency that should ever clear it.
+  useEffect(() => {
+    pathOwnerRef.current = new Map()
+  }, [feedKey])
 
   // The fetch itself, with no policy: `loadNext` and `retry` differ only in which guards
   // they apply before calling this.
@@ -330,14 +606,19 @@ export function useFeed<TCustom = Record<string, unknown>>(
     setLoadingMore(true)
     try {
       const page = await client.feed(group, id).get<TCustom>({ limit: pageSize, next }, { signal })
+      // Objects DO merge across pages (unlike `promoted`, which is only ever resolved on
+      // an uncursored read): a later page can introduce refs the first page didn't carry,
+      // and replacing the map would blank cards that already resolved off page 1.
+      const mergedObjects = { ...objectsRef.current, ...(page.objects ?? {}) }
       setActivities((prev) => {
         const merged = mergeById(prev, page.results)
-        // Page 2+ carries no sidecar by contract — carry the cached one forward so
-        // repeat placement keeps filling slots as the list grows.
-        setCache({ activities: merged, next: page.next, promoted: promotedRef.current })
+        // Page 2+ carries no promoted sidecar by contract — carry the cached one forward
+        // so repeat placement keeps filling slots as the list grows.
+        setCache({ activities: merged, next: page.next, promoted: promotedRef.current, objects: mergedObjects })
         return merged
       })
       setNext(page.next)
+      setObjects(mergedObjects)
     } catch (err) {
       if (!isAbort(err)) setError(err as Error)
     } finally {
@@ -369,17 +650,129 @@ export function useFeed<TCustom = Record<string, unknown>>(
   }, [fetchNext])
 
   const addActivity = useCallback(
-    async (a: { verb: string; object: string; target?: string | null; foreign_id?: string | null; time?: string; custom?: TCustom }) => {
+    async (a: {
+      verb: string; object: string; target?: string | null; foreign_id?: string | null; time?: string; custom?: TCustom
+      /** Objects this activity points at, as `type:id`. Max 4. Resolved into `objects` above. */
+      refs?: string[]
+    }) => {
       if (client === null) return undefined // disabled — no-op resolving undefined
       const created = await client.feed(group, id).addActivity<TCustom>(a)
       setActivities((prev) => {
         const merged = [created, ...prev]
-        setCache({ activities: merged, next: cache.get(feedKey)?.next ?? next })
+        // Carry the existing sidecars forward — `setCache` REPLACES the entry, so
+        // omitting them would blank a remount's promoted slots / resolved refs even
+        // though nothing about them actually changed.
+        setCache({
+          activities: merged, next: cache.get(feedKey)?.next ?? next,
+          promoted: promotedRef.current, objects: objectsRef.current,
+        })
         return merged
       })
       return created
     },
     [client, cache, feedKey, group, id, next],
+  )
+
+  /**
+   * Patch an activity's `custom` optimistically. Structured like `useReactions`'
+   * `react`/`unreact` — `if (client === null) return`, apply locally via `applyPatch`
+   * (which carries the prototype-pollution guard — see its comment), call the network,
+   * replace with the server's value on success (it carries `edited_at` and any
+   * server-side coercion the optimistic copy can't know about), and on failure roll back
+   * AND reject — unless `onError` is supplied (per-call or via `<DropInProvider
+   * onError>`), in which case it rolls back and resolves `undefined` instead. See the
+   * file header for the full contract.
+   *
+   * UNLIKE `react`/`unreact`, the rollback here is NOT a whole-state snapshot restore.
+   * `useReactions` can get away with that because its blast radius is one activity's
+   * local counters; this hook's state is the shared `activities` ARRAY, and a
+   * `refresh()`/`loadNext()` landing while a patch is in flight is a normal, expected
+   * race — restoring a captured array snapshot on failure would silently discard
+   * whatever that concurrent read brought in. So the rollback instead re-derives from
+   * the CURRENT array at failure time and applies only the INVERSE of the paths THIS
+   * call itself touched (via `priorValuesFor`/`inversePatchFor`), leaving everything
+   * else — other activities, other fields — untouched. `pathOwnerRef` further scopes
+   * that to paths this call still "owns": if a second `updateActivity` on the same path
+   * started after this one and is still standing, this call's failure does not stomp it.
+   *
+   * A no-op (activities unchanged) if `activityId` isn't in the currently-loaded list —
+   * the network call still fires, since the activity may simply be off-page.
+   *
+   * @throws The network error after the optimistic patch has been rolled back (no
+   * `onError` supplied).
+   */
+  const updateActivity = useCallback(
+    async (
+      activityId: string,
+      body: PatchBody,
+      callOpts?: { onError?: OptimisticOnError },
+    ): Promise<Activity<TCustom> | undefined> => {
+      if (client === null) return undefined // disabled — no optimistic write, no network
+      const token = Symbol('updateActivity')
+      const touchedPaths = [...Object.keys(body.set ?? {}), ...(body.unset ?? [])]
+      const target = activitiesRef.current.find((a) => a.id === activityId)
+      // `null`, not an empty Map, when the activity isn't currently loaded — failure
+      // then has nothing to revert (the optimistic apply below was already a no-op).
+      const prior = target ? priorValuesFor(target.custom, touchedPaths) : null
+      for (const path of touchedPaths) setOwner(pathOwnerRef.current, activityId, path, token)
+      // Optimistic.
+      setActivities((prevActs) => {
+        const merged = prevActs.map((a) => (a.id === activityId ? applyPatch<TCustom>(a, body) : a))
+        setCache({
+          activities: merged, next: cache.get(feedKey)?.next ?? next,
+          promoted: promotedRef.current, objects: objectsRef.current,
+        })
+        return merged
+      })
+      try {
+        const updated = await client.feed(group, id).updateActivity<TCustom>(activityId, body)
+        setActivities((prevActs) => {
+          const merged = prevActs.map((a) => (a.id === activityId ? updated : a))
+          setCache({
+            activities: merged, next: cache.get(feedKey)?.next ?? next,
+            promoted: promotedRef.current, objects: objectsRef.current,
+          })
+          return merged
+        })
+        return updated
+      } catch (err) {
+        if (prior !== null) {
+          // Revert only the paths THIS call still owns — ownership moves to a newer
+          // overlapping updateActivity call on the same path the moment it optimistically
+          // writes there, so a since-superseded path is left alone rather than stomped.
+          const stillOwned = touchedPaths.filter(
+            (path) => isOwner(pathOwnerRef.current, activityId, path, token),
+          )
+          if (stillOwned.length > 0) {
+            const inverse = inversePatchFor(prior, stillOwned)
+            setActivities((prevActs) => {
+              // Re-derive from the CURRENT array, not a captured snapshot — anything a
+              // concurrent refresh()/loadNext() brought in since this call started
+              // (other activities, or other fields on this one) must survive.
+              const merged = prevActs.map((a) => (a.id === activityId ? applyPatch<TCustom>(a, inverse) : a))
+              setCache({
+                activities: merged, next: cache.get(feedKey)?.next ?? next,
+                promoted: promotedRef.current, objects: objectsRef.current,
+              })
+              return merged
+            })
+          }
+        }
+        const handler = resolveOnError(callOpts, onError)
+        if (handler) {
+          handler(err as Error, { hook: 'useFeed', action: 'updateActivity', activityId })
+          return undefined
+        }
+        throw err
+      } finally {
+        // This call is done either way — drop the ownership entries it still holds so
+        // the map doesn't grow unboundedly across a long-lived feed. A path a newer
+        // overlapping call has since taken over is left alone (releaseOwnedPaths only
+        // removes entries still pointing at `token`).
+        releaseOwnedPaths(pathOwnerRef.current, activityId, touchedPaths, token)
+      }
+    },
+    [client, cache, feedKey, group, id, next, onError],
   )
 
   const refresh = useCallback(async () => {
@@ -392,11 +785,15 @@ export function useFeed<TCustom = Record<string, unknown>>(
       const page = await client.feed(group, id).get<TCustom>({ limit: pageSize }, { signal })
       // refresh() is an uncursored read, so it also re-resolves eligibility — which is
       // how a promotion that expired mid-session stops rendering from the client cache.
+      // Objects REPLACE here too (not merge): refresh is initial-style, and an object
+      // deleted server-side mid-session should stop resolving, not linger from the cache.
       const side = page.promoted ?? []
-      setCache({ activities: page.results, next: page.next, promoted: side })
+      const objSide = page.objects ?? {}
+      setCache({ activities: page.results, next: page.next, promoted: side, objects: objSide })
       setActivities(page.results)
       setNext(page.next)
       setPromoted(side)
+      setObjects(objSide)
       // refresh() authoritatively replaces activities from the server, so any
       // checkNew() buffer is now stale (page 1 may already include what it buffered,
       // e.g. an at-least-once replay) — drop it, or showNew() would later duplicate.
@@ -426,7 +823,10 @@ export function useFeed<TCustom = Record<string, unknown>>(
       const cur = activitiesRef.current
       // A previously-empty feed has nothing to "jump" — load its first activities directly.
       if (cur.length === 0) {
-        setCache({ activities: page.results, next: page.next, promoted: promotedRef.current })
+        setCache({
+          activities: page.results, next: page.next,
+          promoted: promotedRef.current, objects: objectsRef.current,
+        })
         setActivities(page.results)
         setNext(page.next)
         return
@@ -478,7 +878,12 @@ export function useFeed<TCustom = Record<string, unknown>>(
     if (p.length === 0) return
     setActivities((a) => {
       const merged = [...p, ...a]
-      setCache({ activities: merged, next: cache.get(feedKey)?.next ?? next })
+      // Carry the existing sidecars forward — see the comment on the same line in
+      // addActivity above.
+      setCache({
+        activities: merged, next: cache.get(feedKey)?.next ?? next,
+        promoted: promotedRef.current, objects: objectsRef.current,
+      })
       return merged
     })
     setPending([])
@@ -549,6 +954,13 @@ export function useFeed<TCustom = Record<string, unknown>>(
     /** `activities` with promoted rows interleaved per the placement props. */
     items,
     trackPromotedClick,
+    /** Refs sidecar for the currently-shown page(s), keyed `type:id`. `{}` when the
+     *  server sent none — never `undefined`. Resolve an activity's refs against it with
+     *  `resolveRefs(activity, objects)`. */
+    objects,
+    /** Optimistic `custom` patch — see the JSDoc above the callback for the full
+     *  reject-after-rollback / onError contract. */
+    updateActivity,
   }
 }
 
@@ -1124,7 +1536,12 @@ export function useNotifications(opts?: {
 export function useFeedActions<TCustom = Record<string, unknown>>(group: string, id: string) {
   const client = useDropInClientOrNull()
   const addActivity = useCallback(
-    async (a: { verb: string; object: string; custom?: TCustom }) =>
+    async (a: {
+      verb: string; object: string; custom?: TCustom
+      /** Objects this activity points at, as `type:id`. Max 4. Resolved into the feed
+       *  read's `objects` sidecar — see `useFeed`. */
+      refs?: string[]
+    }) =>
       client === null ? undefined : client.feed(group, id).addActivity<TCustom>(a),
     [client, group, id],
   )

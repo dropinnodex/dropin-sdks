@@ -8,11 +8,14 @@ import * as jose from 'jose'
 // @dropinnodex/server, not the reverse. This is what makes `feed().get()` return a typed
 // `Page<Activity<TCustom>>` instead of `unknown`, so SSR `initialData` flows typed end to end.
 import type {
-  Activity, FeedPage, Follow, FollowStats, Notification, NotificationPage, Page, PromotedActivity, Reaction,
-  RequestOptions, Suggestion,
+  Activity, DropInObject, FeedPage, Follow, FollowStats, Notification, NotificationPage, Page, PatchBody,
+  PromotedActivity, Reaction, RequestOptions, Suggestion,
 } from '@dropinnodex/client'
 
-export type { RequestOptions, Follow, Notification, NotificationPage, PromotedActivity, Reaction, Suggestion }
+export type {
+  RequestOptions, Follow, Notification, NotificationPage, PromotedActivity, Reaction, Suggestion,
+  DropInObject, PatchBody,
+}
 
 /**
  * A webhook destination. The delivery infrastructure owns storage and the full response
@@ -139,6 +142,23 @@ function qs(params: Record<string, string | number | undefined>): string {
   return s ? `?${s}` : ''
 }
 
+/**
+ * `encodeURIComponent` leaves `.` untouched, so a segment of exactly `.` or `..` survives
+ * encoding and is then removed by the URL parser inside fetch — before the request is
+ * sent. A two-segment path like /v1/objects/{type}/{id} therefore lets `type: '..'`
+ * cancel the literal `objects` segment and `id` name an arbitrary sibling route, carrying
+ * this client's server token. Mirrors the inbound guard in the gateway (0042bac).
+ */
+function pathSegment(value: string): string {
+  if (value === '.' || value === '..') {
+    throw new Error(`invalid path segment ${JSON.stringify(value)}: a dot-segment would be removed by URL normalization inside fetch, silently retargeting the request`)
+  }
+  return encodeURIComponent(value)
+}
+
+const objectPath = (type: string, id: string): string =>
+  `/v1/objects/${pathSegment(type)}/${pathSegment(id)}`
+
 type FetchFn = typeof fetch
 
 export class DropInServer {
@@ -221,8 +241,8 @@ export class DropInServer {
   /** Invalidates all of a user's existing tokens immediately. The revocation is recorded
    *  server-side and enforced from the next request onward, so tokens already handed to a
    *  browser stop working without waiting for them to expire. */
-  revokeUserTokens(userId: string, opts: RequestOptions = {}): Promise<void> {
-    return this.call('POST', `/v1/users/${encodeURIComponent(userId)}/revoke-tokens`, undefined, opts)
+  async revokeUserTokens(userId: string, opts: RequestOptions = {}): Promise<void> {
+    return this.call('POST', `/v1/users/${pathSegment(userId)}/revoke-tokens`, undefined, opts)
   }
 
   /** Outbound webhooks. Server-token only — this is where you register the endpoints feed
@@ -232,8 +252,8 @@ export class DropInServer {
     create: (d: { url: string }, opts: RequestOptions = {}) =>
       this.call<WebhookDestination>('POST', '/v1/webhooks', d, opts),
     list: (opts: RequestOptions = {}) => this.call<WebhookDestination[]>('GET', '/v1/webhooks', undefined, opts),
-    remove: (id: string, opts: RequestOptions = {}) =>
-      this.call<void>('DELETE', `/v1/webhooks/${encodeURIComponent(id)}`, undefined, opts),
+    remove: async (id: string, opts: RequestOptions = {}) =>
+      this.call<void>('DELETE', `/v1/webhooks/${pathSegment(id)}`, undefined, opts),
   }
 
   /**
@@ -284,8 +304,48 @@ export class DropInServer {
       'GET', `/v1/promoted${qs({ limit: q.limit, next: q.next })}`, undefined, opts,
     ),
     /** Stop serving it. Takes effect on the next feed read; retracting twice is NOT_FOUND. */
-    remove: (id: string, opts: RequestOptions = {}) =>
-      this.call<void>('DELETE', `/v1/promoted/${encodeURIComponent(id)}`, undefined, opts),
+    remove: async (id: string, opts: RequestOptions = {}) =>
+      this.call<void>('DELETE', `/v1/promoted/${pathSegment(id)}`, undefined, opts),
+  }
+
+  /**
+   * Objects: data many activities share. Update one row and every timeline carrying a ref
+   * to it is fresh on the next read — no re-fan-out, regardless of how many activities
+   * point at it. Server-token only, because one object is shared by many activities.
+   *
+   * @example
+   * await dropin.objects.upsert('session', '1234', { spots_left: 2 })
+   * // every activity with refs: ['session:1234'] now renders 2
+   */
+  readonly objects = {
+    /** Replaces `custom` wholesale, creating the object if absent. */
+    upsert: async <TCustom = Record<string, unknown>>(
+      type: string, id: string, custom: TCustom, opts: RequestOptions = {},
+    ) => this.call<DropInObject<TCustom>>('PUT', objectPath(type, id), { custom }, opts),
+
+    /** Merges into `custom`. The object must exist — use `upsert` to create. */
+    patch: async <TCustom = Record<string, unknown>>(
+      type: string, id: string, body: PatchBody, opts: RequestOptions = {},
+    ) => this.call<DropInObject<TCustom>>('PATCH', objectPath(type, id), body, opts),
+
+    get: async <TCustom = Record<string, unknown>>(type: string, id: string, opts: RequestOptions = {}) =>
+      this.call<DropInObject<TCustom>>('GET', objectPath(type, id), undefined, opts),
+
+    remove: async (type: string, id: string, opts: RequestOptions = {}) =>
+      this.call<void>('DELETE', objectPath(type, id), undefined, opts),
+  }
+
+  /**
+   * Activity-level edits. Use this to fix ONE activity's own body — a typo, a corrected
+   * caption. For data shared across many activities, use `objects` instead: patching each
+   * activity is N writes where an object update is one.
+   */
+  readonly activities = {
+    patch: async <TCustom = Record<string, unknown>>(
+      activityId: string, body: PatchBody, opts: RequestOptions = {},
+    ) => this.call<Activity<TCustom>>(
+      'PATCH', `/v1/activities/${pathSegment(activityId)}`, body, opts,
+    ),
   }
 
   /** Cold-start import (server-token only, ≤100 items/call, quiet — no notifications,
@@ -319,23 +379,28 @@ export class DropInServer {
       activities: Array<{ feed: string; activity: Record<string, unknown> }>,
       opts: RequestOptions = {},
     ) => this.call<BatchResponse>('POST', '/v1/batch/activities', { activities }, opts),
+    /** Bulk upsert objects. Idempotent — safe to re-run. Check `results[i].ok`. */
+    objects: (
+      objects: { type: string; id: string; custom: Record<string, unknown> }[],
+      opts: RequestOptions = {},
+    ) => this.call<BatchResponse>('POST', '/v1/batch/objects', { objects }, opts),
   }
 
   /** Admin reaction ops (server token deletes any user's reaction). Adding a reaction is
    *  deliberately absent: a reaction needs an acting user, and a server token has no
    *  identity — mint a user token for that. */
   readonly reactions = {
-    delete: (reactionId: string, opts: RequestOptions = {}) =>
-      this.call<void>('DELETE', `/v1/reactions/${encodeURIComponent(reactionId)}`, undefined, opts),
+    delete: async (reactionId: string, opts: RequestOptions = {}) =>
+      this.call<void>('DELETE', `/v1/reactions/${pathSegment(reactionId)}`, undefined, opts),
     /** A page of reactions on an activity, newest first. `kind` filters server-side. */
-    list: (
+    list: async (
       activityId: string,
       q: { kind?: string; limit?: number; next?: string; /** @deprecated use `next` */ cursor?: string } = {},
       opts: RequestOptions = {},
     ) =>
       this.call<Page<Reaction>>(
         'GET',
-        `/v1/activities/${encodeURIComponent(activityId)}/reactions${qs({
+        `/v1/activities/${pathSegment(activityId)}/reactions${qs({
           kind: q.kind, limit: q.limit, next: q.next ?? q.cursor,
         })}`,
         undefined, opts,
@@ -367,68 +432,78 @@ export class DropInServer {
   }
 
   feed(group: string, id: string) {
-    const base = `/v1/feeds/${encodeURIComponent(group)}/${encodeURIComponent(id)}`
+    // Deliberately NOT computed eagerly: this method is a plain object-returning function
+    // (not async, for fluent chaining), so a synchronous pathSegment() throw here would
+    // crash the caller synchronously instead of producing a rejected Promise — the one
+    // guarded call site that broke the "every SDK error is a rejection" contract every
+    // other guarded method upholds by being `async`. Computing the path lazily, inside
+    // each `async` method below, means the throw happens inside an async function body
+    // and is converted into a rejection like every other one.
+    const path = () => `/v1/feeds/${pathSegment(group)}/${pathSegment(id)}`
     return {
-      addActivity: <TCustom = Record<string, unknown>>(a: {
+      addActivity: async <TCustom = Record<string, unknown>>(a: {
         /** Server tokens set the actor explicitly (e.g. "user:alice"); user tokens
          *  have it overwritten by the gateway (spec §5). */
         actor?: string
         verb: string; object: string; target?: string | null
         foreign_id?: string | null; time?: string; custom?: TCustom
-      }, opts: RequestOptions = {}) => this.call<Activity<TCustom>>('POST', `${base}/activities`, a, opts),
-      get: <TCustom = Record<string, unknown>>(
+        /** Objects this activity points at, as `type:id`. Max 4. Resolved into the
+         *  feed read's `objects` sidecar — see `dropin.objects`. */
+        refs?: string[]
+      }, opts: RequestOptions = {}) => this.call<Activity<TCustom>>('POST', `${path()}/activities`, a, opts),
+      get: async <TCustom = Record<string, unknown>>(
         q: { limit?: number; next?: string; /** @deprecated use `next` */ cursor?: string } = {},
         opts: RequestOptions = {},
       ) =>
         // FeedPage, not Page: a server-rendered first page carries the `promoted`
         // sidecar too, and passing it into useFeed's initialData must not drop it.
         this.call<FeedPage<TCustom>>(
-          'GET', `${base}${qs({ limit: q.limit, next: q.next ?? q.cursor })}`, undefined, opts,
+          'GET', `${path()}${qs({ limit: q.limit, next: q.next ?? q.cursor })}`, undefined, opts,
         ),
-      followStats: (opts: RequestOptions = {}) =>
-        this.call<FollowStats>('GET', `${base}/stats`, undefined, opts),
+      followStats: async (opts: RequestOptions = {}) =>
+        this.call<FollowStats>('GET', `${path()}/stats`, undefined, opts),
       /** Create a follow edge, LOUD: a `user:` target gets a follow notification and a
        *  `follow.added` webhook fires. This is the call for a follow that just happened in
        *  your app — `batch.follows` is the quiet import path and notifies nobody.
        *
        *  Idempotent: re-following an existing edge writes nothing and notifies nobody, so
        *  an at-least-once trigger can safely deliver twice. */
-      follow: (targetGroup: string, targetId: string, opts: RequestOptions = {}) =>
-        this.call<void>('POST', `${base}/follows`, { target: `${targetGroup}:${targetId}` }, opts),
+      follow: async (targetGroup: string, targetId: string, opts: RequestOptions = {}) =>
+        this.call<void>('POST', `${path()}/follows`, { target: `${targetGroup}:${targetId}` }, opts),
       /** Remove a follow edge. Same argument shape as `follow`. */
-      unfollow: (targetGroup: string, targetId: string, opts: RequestOptions = {}) =>
+      unfollow: async (targetGroup: string, targetId: string, opts: RequestOptions = {}) =>
         this.call<void>(
           'DELETE',
-          `${base}/follows/${encodeURIComponent(targetGroup)}/${encodeURIComponent(targetId)}`,
+          `${path()}/follows/${pathSegment(targetGroup)}/${pathSegment(targetId)}`,
           undefined, opts,
         ),
       /** Who follows this feed, newest edge first. */
-      followers: (
+      followers: async (
         q: { limit?: number; next?: string; /** @deprecated use `next` */ cursor?: string } = {},
         opts: RequestOptions = {},
       ) =>
         this.call<Page<Follow>>(
-          'GET', `${base}/followers${qs({ limit: q.limit, next: q.next ?? q.cursor })}`, undefined, opts,
+          'GET', `${path()}/followers${qs({ limit: q.limit, next: q.next ?? q.cursor })}`, undefined, opts,
         ),
       /** Who this feed follows, newest edge first. */
-      following: (
+      following: async (
         q: { limit?: number; next?: string; /** @deprecated use `next` */ cursor?: string } = {},
         opts: RequestOptions = {},
       ) =>
         this.call<Page<Follow>>(
-          'GET', `${base}/follows${qs({ limit: q.limit, next: q.next ?? q.cursor })}`, undefined, opts,
+          'GET', `${path()}/follows${qs({ limit: q.limit, next: q.next ?? q.cursor })}`, undefined, opts,
         ),
       /** Who this feed should follow — friends-of-friends by mutual overlap, topped up by
        *  popularity. A capped top-N, so there is no cursor. */
-      suggestions: (q: { limit?: number } = {}, opts: RequestOptions = {}) =>
+      suggestions: async (q: { limit?: number } = {}, opts: RequestOptions = {}) =>
         this.call<{ results: Suggestion[] }>(
-          'GET', `${base}/suggestions${qs({ limit: q.limit })}`, undefined, opts,
+          'GET', `${path()}/suggestions${qs({ limit: q.limit })}`, undefined, opts,
         ),
       /** Soft-delete an activity. A server token may remove an activity from ANY feed —
        *  the origin-feed authority check applies to user tokens only — which is what makes
        *  this usable for moderation and for cleaning up content deleted in your own app. */
-      removeActivity: (activityId: string, opts: RequestOptions = {}) =>
-        this.call<void>('DELETE', `/v1/activities/${encodeURIComponent(activityId)}`, undefined, opts),
+      removeActivity: async (activityId: string, opts: RequestOptions = {}) =>
+        this.call<void>('DELETE', `/v1/activities/${pathSegment(activityId)}`, undefined, opts),
     }
   }
 

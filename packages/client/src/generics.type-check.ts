@@ -2,7 +2,7 @@
 // from coverage/build output semantics by being pure types. Checked via `pnpm typecheck`
 // (tsc -b) since vitest's --typecheck does not fire for plain .test.ts files in this repo's
 // swc-transformed node project (see index.test.ts history / Task 1 report).
-import type { Activity, Page } from './index.js'
+import type { Activity, DropInClient, Page } from './index.js'
 
 // Activity<TCustom> narrows `custom`; the default keeps existing callers compiling.
 type CustomFit = Activity<{ title: string }>
@@ -26,3 +26,16 @@ void badCustom
 void defaultCustom
 void page
 void actorUserCustom
+
+// refs is a plain inline-literal field on feed().addActivity — not a workaround, not a
+// cast. The wire API has always accepted it (v1.yaml ActivityInput); this asserts the
+// SDK type does too. Never invoked — see the file header.
+async function _checkAddActivityRefs(c: DropInClient) {
+  await c.feed('user', 'alice').addActivity({
+    verb: 'post',
+    object: 'session:1234',
+    custom: { anything: 1 },
+    refs: ['session:1234'],
+  })
+}
+void _checkAddActivityRefs

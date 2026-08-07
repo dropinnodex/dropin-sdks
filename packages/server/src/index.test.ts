@@ -116,6 +116,16 @@ describe('HTTP helpers', () => {
     expect(lastCall(fn)[1].method).toBe('POST')
   })
 
+  it('feed().addActivity sends refs as a plain inline-literal field, unmodified', async () => {
+    const fn = mockFetchOnce({ status: 201, json: { id: 'a1' } })
+    await dropin.feed('user', 'alice').addActivity({
+      verb: 'post', object: 'session:1234', custom: { text: 'hi' }, refs: ['session:1234'],
+    })
+    expect(JSON.parse(lastCall(fn)[1].body!)).toEqual({
+      verb: 'post', object: 'session:1234', custom: { text: 'hi' }, refs: ['session:1234'],
+    })
+  })
+
   it('feed().get builds a keyset query string with the canonical `next` param', async () => {
     const fn = mockFetchOnce({ status: 200, json: { results: [], next: null } })
     await dropin.feed('user', 'alice').get({ limit: 5, next: 'TOK' })
@@ -470,6 +480,84 @@ describe('DropInServer.reactions', () => {
   })
 })
 
+describe('objects and patch', () => {
+  function recordingServer() {
+    const calls: Array<{ method: string; path: string; body?: unknown }> = []
+    const fetchMock = vi.fn(async (url: string, init: FetchCallOpts) => {
+      calls.push({ method: init.method, path: new URL(url).pathname, body: init.body ? JSON.parse(init.body) : undefined })
+      const status = init.method === 'DELETE' ? 204 : 200
+      return {
+        ok: true, status,
+        json: async () => ({ type: 'session', id: '1', custom: {}, updated_at: '2026-08-07T00:00:00Z' }),
+        text: async () => (status === 204 ? '' : JSON.stringify({ type: 'session', id: '1', custom: {}, updated_at: '2026-08-07T00:00:00Z' })),
+      }
+    })
+    const server = new DropInServer(
+      { tenantId: 'acme', apiKey: 'k', apiSecret: 's', url: 'http://gw' },
+      fetchMock as never,
+    )
+    return { server, calls, fetchMock }
+  }
+
+  it('upserts an object with PUT', async () => {
+    const { server, calls } = recordingServer()
+    const obj = await server.objects.upsert('session', '1', { spots_left: 2 })
+    expect(calls).toEqual([
+      { method: 'PUT', path: '/v1/objects/session/1', body: { custom: { spots_left: 2 } } },
+    ])
+    expect(obj.type).toBe('session')
+  })
+
+  it('url-encodes type and id', async () => {
+    const { server, calls } = recordingServer()
+    await server.objects.get('a/b', 'c d')
+    expect(calls).toEqual([
+      { method: 'GET', path: '/v1/objects/a%2Fb/c%20d', body: undefined },
+    ])
+  })
+
+  it('patches an object with PATCH', async () => {
+    const { server, calls } = recordingServer()
+    await server.objects.patch('session', '1', { set: { 'custom.spots_left': 1 } })
+    expect(calls).toEqual([
+      { method: 'PATCH', path: '/v1/objects/session/1', body: { set: { 'custom.spots_left': 1 } } },
+    ])
+  })
+
+  it('removes an object', async () => {
+    const { server, calls } = recordingServer()
+    await expect(server.objects.remove('session', '1')).resolves.toBeUndefined()
+    expect(calls).toEqual([
+      { method: 'DELETE', path: '/v1/objects/session/1', body: undefined },
+    ])
+  })
+
+  it('patches an activity', async () => {
+    const { server, calls } = recordingServer()
+    await server.activities.patch('a1', { set: { 'custom.title': 'fixed' } })
+    expect(calls).toEqual([
+      { method: 'PATCH', path: '/v1/activities/a1', body: { set: { 'custom.title': 'fixed' } } },
+    ])
+  })
+
+  it('bulk-upserts objects', async () => {
+    const { server, calls } = recordingServer()
+    const objects = [{ type: 'session', id: '1', custom: { spots_left: 2 } }]
+    await server.batch.objects(objects)
+    expect(calls).toEqual([
+      { method: 'POST', path: '/v1/batch/objects', body: { objects } },
+    ])
+  })
+
+  it('carries the server-token bearer, like every other server-only route', async () => {
+    const { server, fetchMock } = recordingServer()
+    await server.objects.get('session', '1')
+    const headers = (fetchMock.mock.calls[0]![1] as FetchCallOpts).headers
+    expect(headers.authorization).toMatch(/^Bearer /)
+    expect(headers['x-api-key']).toBe('k')
+  })
+})
+
 describe('AbortSignal', () => {
   it('forwards the signal to fetch', async () => {
     const ctrl = new AbortController()
@@ -570,5 +658,106 @@ describe('request timeout', () => {
         init.signal?.addEventListener('abort', () => reject(init.signal!.reason))
       })))
     await expect(short.batch.users([{ id: 'a' }])).rejects.toThrow(/timeout|abort/i)
+  })
+})
+
+describe('dot-segment path guard', () => {
+  // `encodeURIComponent` leaves `.` untouched. A segment that is EXACTLY `.` or `..`
+  // survives encoding and is then removed by the URL parser inside fetch, before the
+  // request is sent — letting one dynamic segment cancel a literal route segment and
+  // the next dynamic segment name an arbitrary sibling route. Every interpolated path
+  // segment in the SDK must reject this rather than silently retargeting the request.
+
+  it('rejects a "." segment without calling fetch', async () => {
+    const fn = mockFetchOnce({ status: 200 })
+    await expect(dropin.objects.get('.', 'x')).rejects.toThrow(/invalid path segment/)
+    expect(fn).not.toHaveBeenCalled()
+  })
+
+  it('rejects a ".." segment without calling fetch', async () => {
+    const fn = mockFetchOnce({ status: 200 })
+    await expect(dropin.objects.get('..', 'x')).rejects.toThrow(/invalid path segment/)
+    expect(fn).not.toHaveBeenCalled()
+  })
+
+  it('rejects ".." in the second segment too', async () => {
+    const fn = mockFetchOnce({ status: 200 })
+    await expect(dropin.objects.get('x', '..')).rejects.toThrow(/invalid path segment/)
+    expect(fn).not.toHaveBeenCalled()
+  })
+
+  it('REGRESSION: objects.get(\'..\', \'activities\') can no longer redirect to /v1/activities', async () => {
+    // This is the exact confused-deputy shape from the report: a tenant looping
+    // objects.get(type, id) over their own catalogue, where a record's `type` happens
+    // to be '..', would otherwise cancel the literal `objects` segment and hit an
+    // arbitrary sibling route carrying this SDK's server token.
+    const fn = mockFetchOnce({ status: 200 })
+    await expect(dropin.objects.get('..', 'activities')).rejects.toThrow(/invalid path segment/)
+    expect(fn).not.toHaveBeenCalled()
+    // Prove it directly too: had the guard not fired, this is what the URL parser
+    // would have done to the naively-constructed path.
+    const naive = `/v1/objects/${encodeURIComponent('..')}/${encodeURIComponent('activities')}`
+    expect(new URL(naive, 'http://x').pathname).toBe('/v1/activities') // the bug, unguarded
+  })
+
+  it('rejects dot segments on feed(group, id) — as a rejection, not a synchronous throw', async () => {
+    // feed() itself must never throw: it is a plain object-returning method (not async,
+    // for fluent chaining), so validating eagerly there would crash the caller
+    // synchronously instead of producing a rejected Promise like every other guarded
+    // call site. The path is validated lazily, inside each async method instead.
+    const fn = mockFetchOnce({ status: 204 })
+    expect(() => dropin.feed('.', 'alice')).not.toThrow()
+    expect(() => dropin.feed('user', '..')).not.toThrow()
+    await expect(dropin.feed('.', 'alice').get()).rejects.toThrow(/invalid path segment/)
+    await expect(dropin.feed('user', '..').get()).rejects.toThrow(/invalid path segment/)
+    await expect(dropin.feed('.', 'alice').addActivity({ verb: 'post', object: 'w:1' })).rejects.toThrow(/invalid path segment/)
+    await expect(dropin.feed('.', 'alice').followStats()).rejects.toThrow(/invalid path segment/)
+    await expect(dropin.feed('.', 'alice').follow('user', 'bob')).rejects.toThrow(/invalid path segment/)
+    await expect(dropin.feed('.', 'alice').followers()).rejects.toThrow(/invalid path segment/)
+    await expect(dropin.feed('.', 'alice').following()).rejects.toThrow(/invalid path segment/)
+    await expect(dropin.feed('.', 'alice').suggestions()).rejects.toThrow(/invalid path segment/)
+    expect(fn).not.toHaveBeenCalled()
+  })
+
+  it('rejects dot segments on feed().unfollow target', async () => {
+    const fn = mockFetchOnce({ status: 204 })
+    await expect(dropin.feed('timeline', 'alice').unfollow('..', 'bob')).rejects.toThrow(/invalid path segment/)
+    await expect(dropin.feed('timeline', 'alice').unfollow('user', '.')).rejects.toThrow(/invalid path segment/)
+    expect(fn).not.toHaveBeenCalled()
+  })
+
+  it('rejects dot segments on every single-segment call site', async () => {
+    const fn = mockFetchOnce({ status: 204 })
+    await expect(dropin.revokeUserTokens('..')).rejects.toThrow(/invalid path segment/)
+    await expect(dropin.webhooks.remove('.')).rejects.toThrow(/invalid path segment/)
+    await expect(dropin.promoted.remove('..')).rejects.toThrow(/invalid path segment/)
+    await expect(dropin.activities.patch('.', { set: {} })).rejects.toThrow(/invalid path segment/)
+    await expect(dropin.reactions.delete('..')).rejects.toThrow(/invalid path segment/)
+    await expect(dropin.reactions.list('.')).rejects.toThrow(/invalid path segment/)
+    await expect(dropin.feed('user', 'bob').removeActivity('..')).rejects.toThrow(/invalid path segment/)
+    expect(fn).not.toHaveBeenCalled()
+  })
+
+  it('still allows the safe cases the guard must not break', async () => {
+    // "/" — a literal slash, inert once encoded.
+    const fn1 = mockFetchOnce({ status: 200, json: { type: 'a/b', id: 'x', custom: {}, updated_at: 't' } })
+    await dropin.objects.get('a/b', 'x')
+    expect(new URL(lastCall(fn1)[0]).pathname).toBe('/v1/objects/a%2Fb/x')
+
+    // A pre-encoded "%2F" stays inert too, double-encoded by encodeURIComponent.
+    const fn2 = mockFetchOnce({ status: 200, json: { type: '%2F', id: 'x', custom: {}, updated_at: 't' } })
+    await dropin.objects.get('%2F', 'x')
+    expect(new URL(lastCall(fn2)[0]).pathname).toBe('/v1/objects/%252F/x')
+
+    // Unicode passes through fine.
+    const fn3 = mockFetchOnce({ status: 200, json: { type: 'café', id: 'x', custom: {}, updated_at: 't' } })
+    await dropin.objects.get('café', 'x')
+    expect(new URL(lastCall(fn3)[0]).pathname).toBe('/v1/objects/caf%C3%A9/x')
+
+    // A legitimate dot INSIDE a longer segment (e.g. a version string) must be allowed —
+    // only a segment that is ENTIRELY "." or ".." is rejected.
+    const fn4 = mockFetchOnce({ status: 200, json: { type: 'release', id: 'v1.2', custom: {}, updated_at: 't' } })
+    await dropin.objects.get('release', 'v1.2')
+    expect(new URL(lastCall(fn4)[0]).pathname).toBe('/v1/objects/release/v1.2')
   })
 })

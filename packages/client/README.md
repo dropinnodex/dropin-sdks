@@ -199,6 +199,28 @@ Notes:
 - Removing a reaction leaves the notification in place; a repeat follow collapses into the
   single existing "X follows you" row.
 
+### Keeping feed data fresh: objects and activity patches
+
+See the [Keeping feed data fresh](https://docs.getnodex.cloud/guides/keeping-feed-data-fresh/)
+guide for the full rule (`custom` if it's true forever, an object if it changes)
+and why delete-and-repost is the wrong tool. From this package:
+
+```ts
+// Objects are server-write-only — this client can read them, never write them.
+const session = await client.objects.get('session', '1234')
+session.custom   // whatever your backend put there
+
+// Patch YOUR OWN activity's `custom` — a typo, a corrected caption. Every path
+// starts with `custom.`; `unset` is applied after `set`.
+await client.feed('user', 'alice').updateActivity(activityId, {
+  set: { 'custom.text': 'Corrected caption' },
+})
+```
+
+A feed read's `objects` sidecar (keyed `type:id`, resolved from every activity's
+`refs` on the page) rides along on `feed().get()` — see `@dropinnodex/react`'s
+README for rendering it with `resolveRefs`.
+
 ## Cancellation
 
 Every method takes an optional `RequestOptions` as its **last** argument:

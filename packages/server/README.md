@@ -45,6 +45,38 @@ development — `url: 'http://localhost:3000'`. No trailing slash.
 with). Delivery infrastructure owns the rest of the shape, so extra fields stay readable
 rather than being typed away.
 
+## Keeping feed data fresh: objects and activity patches
+
+Two ways to update feed data after it's posted — see the [Keeping feed data
+fresh](https://docs.getnodex.cloud/guides/keeping-feed-data-fresh/) guide for the
+full rule (`custom` if it's true forever, an object if it changes) and why
+delete-and-repost is the wrong tool.
+
+```ts
+// Objects: data many activities can point at. One write refreshes every
+// timeline holding a ref — no re-fan-out.
+await dropin.objects.upsert('session', '1234', { spots_left: 12 }) // replace, creates if absent
+await dropin.objects.patch('session', '1234', { set: { 'custom.spots_left': 11 } }) // merge, 404s if absent
+await dropin.objects.get('session', '1234')
+await dropin.objects.remove('session', '1234')
+await dropin.batch.objects([{ type: 'session', id: '5678', custom: { spots_left: 4 } }])
+
+// Point an activity at an object with `refs` (max 4, `type:id`):
+await dropin.feed('user', 'alice').addActivity({
+  verb: 'post', object: 'session:1234',
+  custom: { title: 'Thursday 5-a-side' },
+  refs: ['session:1234'],
+})
+
+// Patch ONE activity's own `custom` — a typo, a corrected caption.
+await dropin.activities.patch(activityId, { set: { 'custom.text': 'Corrected caption' } })
+```
+
+`custom` is **required** on `upsert`/`batch.objects` — it replaces the object's
+`custom` wholesale, so omitting it would wipe the object; the server rejects the
+call instead. Every patch path (objects and activities) must start with
+`custom.`; `unset` is applied after `set`.
+
 ## Cancellation
 
 Every method takes an optional `RequestOptions` as its **last** argument, for cancelling a

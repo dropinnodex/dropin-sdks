@@ -57,6 +57,26 @@ describe('useFeed', () => {
     expect(result.current.isLoading).toBe(false)
   })
 
+  it('surfaces client.feed() itself throwing SYNCHRONOUSLY through error, not a render crash', async () => {
+    // Regression: @dropinnodex/client's feed(group, id) is a plain object-returning method
+    // (not async, for fluent chaining) that used to validate its dot-segment guard eagerly
+    // — so `feed('user', '..')` threw synchronously instead of rejecting, and this hook's
+    // mount effect called `client.feed(group, id).get(...)` with no surrounding try/catch,
+    // crashing the component during effect commit instead of reaching `error`. The SDK no
+    // longer throws synchronously there (the guard moved into each async method), but this
+    // hook's mount effect also wraps the kickoff in its own try/catch as defense-in-depth —
+    // this test simulates the old failure mode directly (a mock `feed()` that throws) to
+    // prove the hook survives it regardless of what the SDK does.
+    const client = makeClient({
+      feed: vi.fn(() => { throw new Error('invalid path segment ".."') }),
+    })
+    const { result } = renderHook(() => useFeed('user', '..'), { wrapper: wrapper(client) })
+    await waitFor(() => expect(result.current.error).not.toBeNull())
+    expect(result.current.error!.message).toMatch(/invalid path segment/)
+    expect(result.current.isLoading).toBe(false)
+    expect(result.current.activities).toEqual([])
+  })
+
   it('loadNext appends and tracks hasNext', async () => {
     const get = vi.fn()
       .mockResolvedValueOnce({ results: [activity('a1')], next: 'cur1' })
@@ -132,6 +152,23 @@ describe('useFeed', () => {
     expect(result.current.activities[0].id).toBe('new1')
     expect(result.current.activities).toHaveLength(2)
     expect(addActivity).toHaveBeenCalledWith({ verb: 'attend', object: 'session:1' })
+  })
+
+  it('addActivity forwards refs as a plain inline-literal field, unmodified', async () => {
+    const get = vi.fn(async () => ({ results: [], next: null }))
+    const addActivity = vi.fn(async () => activity('new1'))
+    const client = makeClient({ feed: vi.fn(() => ({ get, addActivity })) })
+    const { result } = renderHook(() => useFeed('user', 'alice'), { wrapper: wrapper(client) })
+    await waitFor(() => expect(result.current.isLoading).toBe(false))
+
+    await act(async () => {
+      await result.current.addActivity({
+        verb: 'post', object: 'session:1234', custom: { text: 'hi' }, refs: ['session:1234'],
+      })
+    })
+    expect(addActivity).toHaveBeenCalledWith({
+      verb: 'post', object: 'session:1234', custom: { text: 'hi' }, refs: ['session:1234'],
+    })
   })
 
   it('refresh re-fetches the first page', async () => {
@@ -892,6 +929,20 @@ describe('useFeedActions', () => {
     await act(async () => { await result.current.deleteActivity('a1') })
     expect(add).toHaveBeenCalledWith({ verb: 'post', object: 'w:1' })
     expect(remove).toHaveBeenCalledWith('a1')
+  })
+
+  it('addActivity forwards refs as a plain inline-literal field, unmodified', async () => {
+    const add = vi.fn(async () => activity('new'))
+    const client = makeClient({ feed: vi.fn(() => ({ addActivity: add })) })
+    const { result } = renderHook(() => useFeedActions('user', 'alice'), { wrapper: wrapper(client) })
+    await act(async () => {
+      await result.current.addActivity({
+        verb: 'post', object: 'session:1234', custom: { text: 'hi' }, refs: ['session:1234'],
+      })
+    })
+    expect(add).toHaveBeenCalledWith({
+      verb: 'post', object: 'session:1234', custom: { text: 'hi' }, refs: ['session:1234'],
+    })
   })
 })
 

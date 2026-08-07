@@ -67,6 +67,7 @@ describe('DropInProvider enabled={false}', () => {
     expect(result.current.newCount).toBe(0)
     expect(result.current.promoted).toEqual([])
     expect(result.current.items).toEqual([])
+    expect(result.current.objects).toEqual({})
     // An inert feed can never load more, so a mounted sentinel stays quiet.
     expect(result.current.canLoadMore).toBe(false)
     expect(result.current.isLoadingInitial).toBe(false)
@@ -75,7 +76,7 @@ describe('DropInProvider enabled={false}', () => {
     expect(Object.keys(result.current).sort()).toEqual([
       'activities', 'addActivity', 'canLoadMore', 'checkNew', 'enabled', 'error', 'hasNext',
       'isLoading', 'isLoadingInitial', 'isLoadingMore', 'items', 'loadNext', 'newCount',
-      'promoted', 'refresh', 'retry', 'showNew', 'trackPromotedClick',
+      'objects', 'promoted', 'refresh', 'retry', 'showNew', 'trackPromotedClick', 'updateActivity',
     ])
     // Its action/read fns are no-ops resolving undefined.
     await act(async () => {
@@ -85,6 +86,9 @@ describe('DropInProvider enabled={false}', () => {
       await expect(result.current.checkNew()).resolves.toBeUndefined()
       await expect(
         result.current.addActivity({ verb: 'post', object: 'w:1' }),
+      ).resolves.toBeUndefined()
+      await expect(
+        result.current.updateActivity('a1', { set: { 'custom.a': 1 } }),
       ).resolves.toBeUndefined()
     })
     // Give any stray effect a chance to fire, then assert zero network.

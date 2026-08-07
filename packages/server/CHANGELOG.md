@@ -1,5 +1,32 @@
 # @dropinnodex/server
 
+## 0.8.0
+
+### Minor Changes
+
+- 9a6e43b: Mutable feed data: objects that many activities can point at, and patch-style
+  updates for a single activity.
+
+  - `dropin.objects.upsert/patch/get/remove` and `dropin.batch.objects` (server)
+  - `dropin.activities.patch` (server), `feed().updateActivity` (client, react)
+  - Feed reads return an `objects` sidecar; `resolveRefs(activity, objects)` maps an
+    activity onto its objects (react)
+  - Activities accept `refs` and return `refs` + `edited_at`
+  - `feed().addActivity` (server, client) and `useFeed`/`useFeedActions`'s `addActivity`
+    (react) now accept `refs?: string[]` directly, as a plain field alongside `custom` —
+    no cast or workaround needed to point a new activity at an object
+
+  **Breaking for hand-built `Activity` mocks:** `Activity` gained two required fields,
+  `refs: string[]` and `edited_at: string | null`. A consumer test suite that builds an
+  `Activity` object literal by hand (rather than getting one back from the SDK) will need
+  to add both fields for it to type-check — `refs: []` and `edited_at: null` restore the
+  pre-upgrade shape.
+
+### Patch Changes
+
+- Updated dependencies [9a6e43b]
+  - @dropinnodex/client@0.4.0
+
 ## 0.7.1
 
 ### Patch Changes

@@ -431,6 +431,97 @@ describe('base URL', () => {
   })
 })
 
+describe('objects', () => {
+  it('client.objects.get(type, id) GETs the object route and returns the parsed object', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, {
+      type: 'session', id: '1', custom: { title: 'Yoga' }, updated_at: '2026-08-07T00:00:00Z',
+    }))
+    const res = await client(async () => 'tok').objects.get('session', '1')
+    expect(callAt(0)[1].method).toBe('GET')
+    expect(lastUrl()).toBe('http://api.test/v1/objects/session/1')
+    expect(res).toEqual({ type: 'session', id: '1', custom: { title: 'Yoga' }, updated_at: '2026-08-07T00:00:00Z' })
+  })
+
+  it('url-encodes both type and id', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, {}))
+    await client(async () => 'tok').objects.get('a/b', 'c d')
+    expect(lastUrl()).toBe('http://api.test/v1/objects/a%2Fb/c%20d')
+  })
+
+  it('exposes no write methods — object writes are server-token only', async () => {
+    const c = client(async () => 'tok')
+    const objects = (c as unknown as Record<string, unknown>).objects as Record<string, unknown>
+    expect(objects).not.toHaveProperty('upsert')
+    expect(objects).not.toHaveProperty('patch')
+    expect(objects).not.toHaveProperty('remove')
+    expect(objects).not.toHaveProperty('set')
+    expect(objects).not.toHaveProperty('delete')
+    expect(Object.keys(objects)).toEqual(['get'])
+  })
+})
+
+describe('addActivity refs', () => {
+  it('sends refs as a plain inline-literal field, unmodified', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(201, { id: 'a1' }))
+    await client(async () => 'tok').feed('user', 'alice').addActivity({
+      verb: 'post', object: 'session:1234', custom: { text: 'hi' }, refs: ['session:1234'],
+    })
+    expect(JSON.parse(callAt(0)[1].body!)).toEqual({
+      verb: 'post', object: 'session:1234', custom: { text: 'hi' }, refs: ['session:1234'],
+    })
+  })
+})
+
+describe('updateActivity', () => {
+  it('PATCHes /v1/activities/:id with the patch body', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, {
+      id: 'a1', actor: 'user:alice', verb: 'post', object: 'w:1', target: null, foreign_id: null,
+      time: '2026-08-07T00:00:00Z', custom: { text: 'x' }, origin_feed: 'user:alice',
+      reaction_counts: {}, actor_user: null, refs: [], edited_at: '2026-08-07T00:00:01Z',
+    }))
+    const res = await client(async () => 'tok')
+      .feed('user', 'alice')
+      .updateActivity('a1', { set: { 'custom.text': 'x' } })
+    expect(callAt(0)[1].method).toBe('PATCH')
+    expect(lastUrl()).toBe('http://api.test/v1/activities/a1')
+    expect(JSON.parse(callAt(0)[1].body!)).toEqual({ set: { 'custom.text': 'x' } })
+    expect(res.edited_at).toBe('2026-08-07T00:00:01Z')
+  })
+
+  it('url-encodes the activity id', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, {}))
+    await client(async () => 'tok').feed('user', 'alice').updateActivity('a/1', { unset: ['custom.text'] })
+    expect(lastUrl()).toBe('http://api.test/v1/activities/a%2F1')
+  })
+})
+
+describe('feed read: objects sidecar', () => {
+  it('surfaces objects when the server includes the sidecar', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, {
+      results: [{
+        id: 'a1', actor: 'user:alice', verb: 'post', object: 'w:1', target: null, foreign_id: null,
+        time: '2026-08-07T00:00:00Z', custom: {}, origin_feed: 'user:alice',
+        reaction_counts: {}, actor_user: null, refs: ['session:1234'], edited_at: null,
+      }],
+      objects: {
+        'session:1234': { type: 'session', id: '1234', custom: { title: 'Yoga' }, updated_at: '2026-08-07T00:00:00Z' },
+      },
+      next: null,
+    }))
+    const page = await client(async () => 'tok').feed('user', 'alice').get()
+    expect(page.objects).toEqual({
+      'session:1234': { type: 'session', id: '1234', custom: { title: 'Yoga' }, updated_at: '2026-08-07T00:00:00Z' },
+    })
+  })
+
+  it('leaves page.objects undefined (key absent) when the server omits the sidecar', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, { results: [], next: null }))
+    const page = await client(async () => 'tok').feed('user', 'alice').get()
+    expect(page.objects).toBeUndefined()
+    expect('objects' in page).toBe(false)
+  })
+})
+
 describe('head', () => {
   it('feed head hits /head and returns the token', async () => {
     fetchMock.mockResolvedValue(jsonResponse(200, { latest: 'act_9' }))
@@ -444,5 +535,108 @@ describe('head', () => {
     const r = await client(async () => 't').notifications.head()
     expect(lastUrl()).toBe('http://api.test/v1/notifications/head')
     expect(r).toEqual({ latest: null })
+  })
+})
+
+describe('dot-segment path guard', () => {
+  // `encodeURIComponent` leaves `.` untouched. A segment that is EXACTLY `.` or `..`
+  // survives encoding and is then removed by the URL parser inside fetch, before the
+  // request is sent — letting one dynamic segment cancel a literal route segment and
+  // the next dynamic segment name an arbitrary sibling route. Every interpolated path
+  // segment in the SDK must reject this rather than silently retargeting the request.
+  // This client is zero-dependency and isomorphic, so it carries its OWN copy of the
+  // guard (it cannot import @dropinnodex/server's) — these tests are independent of
+  // the server package's equivalent suite on purpose.
+
+  it('rejects a "." segment without calling fetch', async () => {
+    await expect(client(async () => 'tok').objects.get('.', 'x')).rejects.toThrow(/invalid path segment/)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('rejects a ".." segment without calling fetch', async () => {
+    await expect(client(async () => 'tok').objects.get('..', 'x')).rejects.toThrow(/invalid path segment/)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('rejects ".." in the second segment too', async () => {
+    await expect(client(async () => 'tok').objects.get('x', '..')).rejects.toThrow(/invalid path segment/)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('REGRESSION: objects.get(\'..\', \'activities\') can no longer redirect to /v1/activities', async () => {
+    // The exact confused-deputy shape from the report: a tenant looping
+    // objects.get(type, id) over their own catalogue, where a record's `type` happens
+    // to be '..', would otherwise cancel the literal `objects` segment and hit an
+    // arbitrary sibling route carrying this client's credentials.
+    await expect(client(async () => 'tok').objects.get('..', 'activities')).rejects.toThrow(/invalid path segment/)
+    expect(fetchMock).not.toHaveBeenCalled()
+    // Prove it directly too: had the guard not fired, this is what the URL parser
+    // would have done to the naively-constructed path.
+    const naive = `/v1/objects/${encodeURIComponent('..')}/${encodeURIComponent('activities')}`
+    expect(new URL(naive, 'http://x').pathname).toBe('/v1/activities') // the bug, unguarded
+  })
+
+  it('rejects dot segments on feed(group, id) — as a rejection, not a synchronous throw', async () => {
+    // feed() itself must never throw: it is a plain object-returning method (not async,
+    // for fluent chaining), so validating eagerly there would crash the caller
+    // synchronously instead of producing a rejected Promise like every other guarded
+    // call site. The path is validated lazily, inside each async method instead.
+    const c = client(async () => 'tok')
+    expect(() => c.feed('.', 'alice')).not.toThrow()
+    expect(() => c.feed('user', '..')).not.toThrow()
+    await expect(c.feed('.', 'alice').get()).rejects.toThrow(/invalid path segment/)
+    await expect(c.feed('user', '..').get()).rejects.toThrow(/invalid path segment/)
+    await expect(c.feed('.', 'alice').addActivity({ verb: 'post', object: 'w:1' })).rejects.toThrow(/invalid path segment/)
+    await expect(c.feed('.', 'alice').follow('user', 'bob')).rejects.toThrow(/invalid path segment/)
+    await expect(c.feed('.', 'alice').followers()).rejects.toThrow(/invalid path segment/)
+    await expect(c.feed('.', 'alice').following()).rejects.toThrow(/invalid path segment/)
+    await expect(c.feed('.', 'alice').followStats()).rejects.toThrow(/invalid path segment/)
+    await expect(c.feed('.', 'alice').suggestions()).rejects.toThrow(/invalid path segment/)
+    await expect(c.feed('.', 'alice').head()).rejects.toThrow(/invalid path segment/)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('rejects dot segments on feed().unfollow target', async () => {
+    const c = client(async () => 'tok')
+    await expect(c.feed('timeline', 'alice').unfollow('..', 'bob')).rejects.toThrow(/invalid path segment/)
+    await expect(c.feed('timeline', 'alice').unfollow('user', '.')).rejects.toThrow(/invalid path segment/)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('rejects dot segments on removeActivity, updateActivity, and reactions', async () => {
+    const c = client(async () => 'tok')
+    await expect(c.feed('user', 'bob').removeActivity('..')).rejects.toThrow(/invalid path segment/)
+    await expect(c.feed('user', 'bob').updateActivity('.', { set: {} })).rejects.toThrow(/invalid path segment/)
+    await expect(c.reactions.add('like', '..')).rejects.toThrow(/invalid path segment/)
+    await expect(c.reactions.list('.')).rejects.toThrow(/invalid path segment/)
+    await expect(c.reactions.delete('..')).rejects.toThrow(/invalid path segment/)
+    await expect(c.reactions.unreact('..', 'like')).rejects.toThrow(/invalid path segment/)
+    await expect(c.reactions.unreact('a1', '..')).rejects.toThrow(/invalid path segment/)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('still allows the safe cases the guard must not break', async () => {
+    const c = client(async () => 'tok')
+
+    // "/" — a literal slash, inert once encoded.
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, {}))
+    await c.objects.get('a/b', 'x')
+    expect(new URL(lastUrl()).pathname).toBe('/v1/objects/a%2Fb/x')
+
+    // A pre-encoded "%2F" stays inert too, double-encoded by encodeURIComponent.
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, {}))
+    await c.objects.get('%2F', 'x')
+    expect(new URL(lastUrl()).pathname).toBe('/v1/objects/%252F/x')
+
+    // Unicode passes through fine.
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, {}))
+    await c.objects.get('café', 'x')
+    expect(new URL(lastUrl()).pathname).toBe('/v1/objects/caf%C3%A9/x')
+
+    // A legitimate dot INSIDE a longer segment (e.g. a version string) must be allowed —
+    // only a segment that is ENTIRELY "." or ".." is rejected.
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, {}))
+    await c.objects.get('release', 'v1.2')
+    expect(new URL(lastUrl()).pathname).toBe('/v1/objects/release/v1.2')
   })
 })

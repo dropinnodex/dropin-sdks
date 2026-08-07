@@ -361,6 +361,47 @@ markRead, refresh }`.
   convenience that reconciles to the server on the next `refresh`.
 - With `live: true`, no need to set `pollInterval`; `live` takes precedence if both are passed.
 
+## Keeping feed data fresh: objects and activity patches
+
+See the [Keeping feed data fresh](https://docs.getnodex.cloud/guides/keeping-feed-data-fresh/)
+guide for the full rule (`custom` if it's true forever, an object if it changes)
+and why delete-and-repost is the wrong tool. `useFeed` gives you both pieces:
+
+```tsx
+import { useFeed, resolveRefs } from '@dropinnodex/react'
+
+function Timeline({ uid }: { uid: string }) {
+  const { activities, objects, updateActivity } = useFeed<{ title: string; spots_left?: number }>(
+    'timeline', uid,
+  )
+
+  return activities.map((activity) => {
+    // Pure, no fetching. A ref with no stored object is skipped, not an error —
+    // always fall back to the activity's own custom.
+    const [session] = resolveRefs(activity, objects)
+    const spotsLeft = session?.custom.spots_left ?? activity.custom.spots_left
+    return <SessionCard key={activity.id} title={activity.custom.title} spotsLeft={spotsLeft} />
+  })
+}
+```
+
+**`objects` is `{}`, never `undefined`.** `@dropinnodex/client`'s `feed().get()`
+types the sidecar as optional — the server omits the key when nothing on the page
+carries a ref — but `useFeed` normalizes that to an empty object, so you can index
+straight into it without a null check.
+
+`updateActivity(activityId, { set, unset })` patches ONE activity's own `custom` —
+optimistic, with rollback and the same reject-after-rollback / `onError` contract
+as `react`/`follow` (see below). Every path starts with `custom.`; identity fields
+(`actor`, `verb`, `object`, `target`, `time`, `foreign_id`) are never patchable.
+
+```tsx
+await updateActivity(activity.id, { set: { 'custom.text': 'Corrected caption' } })
+```
+
+Objects themselves are server-write-only — there's no `useObject`/write hook here
+on purpose; create and update them from your backend with `@dropinnodex/server`.
+
 ## Optimistic writes reject after rollback
 
 Every action that updates local state optimistically — `react`, `unreact`, `remove` (reaction
@@ -428,6 +469,7 @@ The `ctx` argument is action-specific so you can route without parsing strings:
 | `useReactionList.remove` | `{ hook, action, activityId, reactionId }` |
 | `useFollow.follow` / `unfollow` | `{ hook, action, source: {group, id}, target: {group, id} }` |
 | `useNotifications.markSeen` / `markRead` | `{ hook, action, ids: string[] \| null }` (`null` = mark-all) |
+| `useFeed.updateActivity` | `{ hook, action, activityId }` |
 
 Disabled-mode (`<DropInProvider enabled={false}>`) actions resolve to `undefined` and do
 NOT invoke `onError` — there is no error to observe.

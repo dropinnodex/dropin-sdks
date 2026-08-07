@@ -15,6 +15,24 @@ export interface Activity<TCustom = Record<string, unknown>> {
   reaction_counts: Record<string, number>
   actor_user: { id: string; custom: Record<string, unknown> } | null
   own_reactions?: string[]
+  /** Objects this activity points at, as `type:id`. Look them up in `FeedPage.objects`. */
+  refs: string[]
+  /** Null until the activity has been patched. */
+  edited_at: string | null
+}
+
+/** Tenant-owned mutable data an activity points at, resolved into `FeedPage.objects`. */
+export interface DropInObject<TCustom = Record<string, unknown>> {
+  type: string
+  id: string
+  custom: TCustom
+  updated_at: string
+}
+
+/** A patch-style update. Every path starts with `custom.`; `unset` applies after `set`. */
+export interface PatchBody {
+  set?: Record<string, unknown>
+  unset?: string[]
 }
 
 export interface Page<T> {
@@ -51,6 +69,12 @@ export interface PromotedActivity<TCustom = Record<string, unknown>> {
  */
 export interface FeedPage<TCustom = Record<string, unknown>> extends Page<Activity<TCustom>> {
   promoted?: PromotedActivity<TCustom>[]
+  /**
+   * Refs on this page, resolved, keyed by `type:id`. Absent when no activity on the page
+   * carries a ref; a ref with no stored object is simply missing from the map, so always
+   * fall back to the activity's own `custom`.
+   */
+  objects?: Record<string, DropInObject<TCustom>>
 }
 
 export interface Follow {
@@ -152,6 +176,23 @@ function abortReason(signal: AbortSignal): unknown {
   return signal.reason ?? new DOMException('The operation was aborted.', 'AbortError')
 }
 
+/**
+ * `encodeURIComponent` leaves `.` untouched, so a segment of exactly `.` or `..` survives
+ * encoding and is then removed by the URL parser inside fetch — before the request is
+ * sent. A two-segment path like /v1/objects/{type}/{id} therefore lets `type: '..'`
+ * cancel the literal `objects` segment and `id` name an arbitrary sibling route, carrying
+ * this client's credentials. Mirrors the inbound guard in the gateway (0042bac) and the
+ * identical guard in @dropinnodex/server — duplicated on purpose: this package is
+ * zero-dependency and isomorphic, so it cannot import from @dropinnodex/server. Do not
+ * "fix" that by adding a dependency.
+ */
+function pathSegment(value: string): string {
+  if (value === '.' || value === '..') {
+    throw new Error(`invalid path segment ${JSON.stringify(value)}: a dot-segment would be removed by URL normalization inside fetch, silently retargeting the request`)
+  }
+  return encodeURIComponent(value)
+}
+
 export class DropInClient {
   /** Cached until a 401. The provider is called on init and again on a 401 — NOT per
    *  request. Per-request calls would double every operation's latency and hammer your
@@ -232,45 +273,61 @@ export class DropInClient {
   }
 
   feed(group: string, id: string) {
-    const base = `/v1/feeds/${encodeURIComponent(group)}/${encodeURIComponent(id)}`
+    // Deliberately NOT computed eagerly: this method is a plain object-returning function
+    // (not async, for fluent chaining), so a synchronous pathSegment() throw here would
+    // crash the caller synchronously instead of producing a rejected Promise — the one
+    // guarded call site that broke the "every SDK error is a rejection" contract every
+    // other guarded method upholds by being `async`. Computing the path lazily, inside
+    // each `async` method below, means the throw happens inside an async function body
+    // and is converted into a rejection like every other one.
+    const path = () => `/v1/feeds/${pathSegment(group)}/${pathSegment(id)}`
     return {
-      get: <TCustom = Record<string, unknown>>(
+      get: async <TCustom = Record<string, unknown>>(
         q: { limit?: number; next?: string; /** @deprecated use `next` */ cursor?: string } = {},
         opts: RequestOptions = {},
       ) =>
-        this.call<FeedPage<TCustom>>('GET', `${base}${this.qs({ limit: q.limit, next: q.next ?? q.cursor })}`, undefined, opts),
-      addActivity: <TCustom = Record<string, unknown>>(a: {
+        this.call<FeedPage<TCustom>>('GET', `${path()}${this.qs({ limit: q.limit, next: q.next ?? q.cursor })}`, undefined, opts),
+      addActivity: async <TCustom = Record<string, unknown>>(a: {
         verb: string; object: string; target?: string | null
         foreign_id?: string | null; time?: string; custom?: TCustom
-      }, opts: RequestOptions = {}) => this.call<Activity<TCustom>>('POST', `${base}/activities`, a, opts),
-      follow: (tGroup: string, tId: string, opts: RequestOptions = {}) =>
-        this.call<void>('POST', `${base}/follows`, { target: `${tGroup}:${tId}` }, opts),
-      unfollow: (tGroup: string, tId: string, opts: RequestOptions = {}) =>
-        this.call<void>('DELETE', `${base}/follows/${encodeURIComponent(tGroup)}/${encodeURIComponent(tId)}`, undefined, opts),
-      followers: (
+        /** Objects this activity points at, as `type:id`. Max 4. Resolved into the
+         *  feed read's `objects` sidecar. */
+        refs?: string[]
+      }, opts: RequestOptions = {}) => this.call<Activity<TCustom>>('POST', `${path()}/activities`, a, opts),
+      follow: async (tGroup: string, tId: string, opts: RequestOptions = {}) =>
+        this.call<void>('POST', `${path()}/follows`, { target: `${tGroup}:${tId}` }, opts),
+      unfollow: async (tGroup: string, tId: string, opts: RequestOptions = {}) =>
+        this.call<void>('DELETE', `${path()}/follows/${pathSegment(tGroup)}/${pathSegment(tId)}`, undefined, opts),
+      followers: async (
         q: { limit?: number; next?: string; /** @deprecated use `next` */ cursor?: string } = {},
         opts: RequestOptions = {},
       ) =>
-        this.call<Page<Follow>>('GET', `${base}/followers${this.qs({ limit: q.limit, next: q.next ?? q.cursor })}`, undefined, opts),
-      following: (
+        this.call<Page<Follow>>('GET', `${path()}/followers${this.qs({ limit: q.limit, next: q.next ?? q.cursor })}`, undefined, opts),
+      following: async (
         q: { limit?: number; next?: string; /** @deprecated use `next` */ cursor?: string } = {},
         opts: RequestOptions = {},
       ) =>
-        this.call<Page<Follow>>('GET', `${base}/follows${this.qs({ limit: q.limit, next: q.next ?? q.cursor })}`, undefined, opts),
+        this.call<Page<Follow>>('GET', `${path()}/follows${this.qs({ limit: q.limit, next: q.next ?? q.cursor })}`, undefined, opts),
       // GetStream mirror: feed.removeActivity(id). Hits the activity route; the gateway
       // enforces authority = origin_feed, so removing from a feed you don't own is a 403.
-      removeActivity: (activityId: string, opts: RequestOptions = {}) =>
-        this.call<void>('DELETE', `/v1/activities/${encodeURIComponent(activityId)}`, undefined, opts),
-      followStats: (opts: RequestOptions = {}) =>
-        this.call<FollowStats>('GET', `${base}/stats`, undefined, opts),
+      removeActivity: async (activityId: string, opts: RequestOptions = {}) =>
+        this.call<void>('DELETE', `/v1/activities/${pathSegment(activityId)}`, undefined, opts),
+      /** Patch an activity's `custom`. Permitted on your own activities only. */
+      updateActivity: async <TCustom = Record<string, unknown>>(
+        activityId: string, body: PatchBody, opts: RequestOptions = {},
+      ) => this.call<Activity<TCustom>>(
+        'PATCH', `/v1/activities/${pathSegment(activityId)}`, body, opts,
+      ),
+      followStats: async (opts: RequestOptions = {}) =>
+        this.call<FollowStats>('GET', `${path()}/stats`, undefined, opts),
       // Who this feed should follow — friends-of-friends ranked by mutual overlap, topped
       // up by popularity. A capped top-N, so no cursor and no `next`.
-      suggestions: (q: { limit?: number } = {}, opts: RequestOptions = {}) =>
-        this.call<{ results: Suggestion[] }>('GET', `${base}/suggestions${this.qs({ limit: q.limit })}`, undefined, opts),
+      suggestions: async (q: { limit?: number } = {}, opts: RequestOptions = {}) =>
+        this.call<{ results: Suggestion[] }>('GET', `${path()}/suggestions${this.qs({ limit: q.limit })}`, undefined, opts),
       /** Cheap change signal (Redis-only server-side). `latest` is an opaque token:
        * compare with the last value you acted on; null means "nothing new". */
-      head: (opts: RequestOptions = {}) =>
-        this.call<{ latest: string | null }>('GET', `${base}/head`, undefined, opts),
+      head: async (opts: RequestOptions = {}) =>
+        this.call<{ latest: string | null }>('GET', `${path()}/head`, undefined, opts),
     }
   }
 
@@ -281,30 +338,41 @@ export class DropInClient {
 
   // GetStream mirror: client.reactions.add(kind, activityId, data) / .list(activityId) / .delete(reactionId).
   readonly reactions = {
-    add: (kind: string, activityId: string, custom: Record<string, unknown> = {}, opts: RequestOptions = {}) =>
-      this.call<Reaction>('POST', `/v1/activities/${encodeURIComponent(activityId)}/reactions`, { kind, custom }, opts),
+    add: async (kind: string, activityId: string, custom: Record<string, unknown> = {}, opts: RequestOptions = {}) =>
+      this.call<Reaction>('POST', `/v1/activities/${pathSegment(activityId)}/reactions`, { kind, custom }, opts),
     /** A page of reactions on an activity, newest first. Optional `kind` filters server-side. */
-    list: (
+    list: async (
       activityId: string,
       q: { kind?: string; limit?: number; next?: string; /** @deprecated use `next` */ cursor?: string } = {},
       opts: RequestOptions = {},
     ) =>
       this.call<Page<Reaction>>(
         'GET',
-        `/v1/activities/${encodeURIComponent(activityId)}/reactions${this.qs({
+        `/v1/activities/${pathSegment(activityId)}/reactions${this.qs({
           kind: q.kind, limit: q.limit, next: q.next ?? q.cursor,
         })}`,
         undefined,
         opts,
       ),
     /** GetStream parity: delete a reaction by its id (from add()/list()). */
-    delete: (reactionId: string, opts: RequestOptions = {}) =>
-      this.call<void>('DELETE', `/v1/reactions/${encodeURIComponent(reactionId)}`, undefined, opts),
+    delete: async (reactionId: string, opts: RequestOptions = {}) =>
+      this.call<void>('DELETE', `/v1/reactions/${pathSegment(reactionId)}`, undefined, opts),
     /** Remove the caller's own reaction of a kind from an activity (no id needed). */
-    unreact: (activityId: string, kind: string, opts: RequestOptions = {}) =>
+    unreact: async (activityId: string, kind: string, opts: RequestOptions = {}) =>
       this.call<void>(
         'DELETE',
-        `/v1/activities/${encodeURIComponent(activityId)}/reactions/${encodeURIComponent(kind)}`,
+        `/v1/activities/${pathSegment(activityId)}/reactions/${pathSegment(kind)}`,
+        undefined,
+        opts,
+      ),
+  }
+
+  /** Objects are server-write-only — this client can read them, never write them. */
+  readonly objects = {
+    get: async <TCustom = Record<string, unknown>>(type: string, id: string, opts: RequestOptions = {}) =>
+      this.call<DropInObject<TCustom>>(
+        'GET',
+        `/v1/objects/${pathSegment(type)}/${pathSegment(id)}`,
         undefined,
         opts,
       ),
