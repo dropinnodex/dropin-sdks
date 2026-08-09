@@ -76,7 +76,8 @@ describe('DropInProvider enabled={false}', () => {
     expect(Object.keys(result.current).sort()).toEqual([
       'activities', 'addActivity', 'canLoadMore', 'checkNew', 'enabled', 'error', 'hasNext',
       'isLoading', 'isLoadingInitial', 'isLoadingMore', 'items', 'loadNext', 'newCount',
-      'objects', 'promoted', 'refresh', 'retry', 'showNew', 'trackPromotedClick', 'updateActivity',
+      'objects', 'promoted', 'refresh', 'retry', 'revalidateObjects', 'showNew',
+      'trackPromotedClick', 'updateActivity',
     ])
     // Its action/read fns are no-ops resolving undefined.
     await act(async () => {
@@ -84,6 +85,7 @@ describe('DropInProvider enabled={false}', () => {
       await expect(result.current.retry()).resolves.toBeUndefined()
       await expect(result.current.refresh()).resolves.toBeUndefined()
       await expect(result.current.checkNew()).resolves.toBeUndefined()
+      await expect(result.current.revalidateObjects()).resolves.toBeUndefined()
       await expect(
         result.current.addActivity({ verb: 'post', object: 'w:1' }),
       ).resolves.toBeUndefined()

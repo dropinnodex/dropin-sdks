@@ -100,9 +100,12 @@ export function capRefs(scope: object, feedKey: string, refs: string[], max: num
 /**
  * Read `refs` and broadcast the result to every subscriber on this feed.
  *
- * Returns without reading when another instance already has a sweep in flight, or when
- * one finished less than `minGapMs` ago — the caller still gets that sweep's data through
- * its subscription, so skipping the request costs it nothing.
+ * Reads nothing when another instance already has a sweep in flight (it awaits that one
+ * instead, so an awaited caller resolves once the shared data has landed rather than
+ * before it), or when one finished less than `minGapMs` ago — the caller still gets that
+ * sweep's data through its subscription, so skipping the request costs it nothing. Pass
+ * `minGapMs: 0` for a hand-triggered sweep: the cooldown exists to stop two offset TIMERS
+ * reading the same data seconds apart, and user intent is not a timer.
  *
  * Chunks are `allSettled`, not `all`: at 200 refs a sweep is two requests, and one of them
  * failing must not discard what the other returned.
@@ -116,7 +119,10 @@ export async function runSweep<TCustom>(
   now: () => number = Date.now,
 ): Promise<void> {
   const s = sweepFor<TCustom>(scope, feedKey)
-  if (s.inflight !== null) return
+  // `.catch` because the owner's promise is awaited here too: it cannot reject by
+  // construction (every chunk is settled), but a throw would propagate into a caller
+  // that merely joined someone else's read.
+  if (s.inflight !== null) { await s.inflight.catch(() => {}); return }
   if (s.lastAt !== 0 && now() - s.lastAt < minGapMs) return
 
   const chunks: string[][] = []

@@ -456,19 +456,29 @@ export interface UseFeedOptions<TCustom = Record<string, unknown>> {
   /** @deprecated Use `live: true` — cheaper (head check, not a full read) and
    * visibility-aware. Kept working; ignored when `live` is set. */
   pollInterval?: number
-  /** Keep this feed fresh: cheap head check every 5s while visible, paused while
-   * hidden, full fetch only when something actually changed. Objects — the mutable half
-   * of a feed — are re-read on their own slower cadence; see `liveObjectsInterval`. */
+  /**
+   * Keep this feed fresh. Two cadences, both paused while the tab is hidden and both
+   * firing immediately on return:
+   *
+   * - every 5s, a head check — one Redis read that answers "did a new activity arrive",
+   *   costing a full page read only when it did;
+   * - every `liveRevalidateInterval`, the changes a head can never report: edits to the
+   *   activities on screen, and re-reads of the objects they point at.
+   */
   live?: boolean
   /**
-   * Milliseconds between object re-reads under `live`. Default 30000; `0` disables the
-   * object sweep while leaving activity freshness untouched.
+   * Milliseconds between revalidation ticks under `live`. Default 30000; `0` disables
+   * revalidation entirely, leaving only the 5s new-activity check.
    *
-   * Separate from the 5s head cadence on purpose. The head check is one Redis read that
-   * usually answers "nothing new"; the object sweep is a real batch read of every ref on
-   * screen, and objects move a handful of times a day, not a handful of times a minute.
-   * Running both at 5s would bill six times the requests for the same information.
+   * Deliberately slower than the head cadence. A head check is one Redis read that
+   * usually answers "nothing new"; a revalidation is a real page read plus a batch object
+   * read, and edits and object updates happen a handful of times a day, not a handful of
+   * times a minute. Running both at 5s would bill six times the requests for the same
+   * information.
    */
+  liveRevalidateInterval?: number
+  /** @deprecated Renamed `liveRevalidateInterval` — the same tick now also picks up
+   * activity edits, not just objects. Still honoured when the new name is absent. */
   liveObjectsInterval?: number
   /**
    * Ceiling on how many refs one object sweep reads, across all its requests. Default
@@ -504,6 +514,9 @@ export function useFeed<TCustom = Record<string, unknown>>(
   const enabled = client !== null
   const feedKey = `${group}:${id}`
   const pageSize = opts?.pageSize ?? 20
+  // Timestamp of the last page-1 read from ANY driver (head-change checkNew, or the
+  // revalidate tick itself), so the two never read the same page seconds apart.
+  const lastPageReadAtRef = useRef(0)
   // The cache is intentionally shared/untyped (one CacheEntry — fixed to the default
   // TCustom — serves every TCustom a caller might use across the app), so both the read
   // and the write need a cast at this boundary rather than threading TCustom through the
@@ -569,6 +582,12 @@ export function useFeed<TCustom = Record<string, unknown>>(
   const [pending, setPending] = useState<Activity<TCustom>[]>([])
   const activitiesRef = useRef(activities)
   activitiesRef.current = activities
+  // Mirrored for the same reason: `reconcileEdits` needs the current cursor to rewrite
+  // the cache entry, and taking `next` as a dependency instead would change its identity
+  // on every page load — which propagates into `checkNew` and re-arms the (deprecated)
+  // `pollInterval` timer from zero on each `loadNext`.
+  const nextRef = useRef(next)
+  nextRef.current = next
   const promotedRef = useRef(promoted)
   promotedRef.current = promoted
   const objectsRef = useRef(objects)
@@ -672,12 +691,60 @@ export function useFeed<TCustom = Record<string, unknown>>(
    * branch) picks up the merged map instead of the pre-merge one.
    */
   const mergeObjects = useCallback((incoming: Record<string, DropInObject<TCustom>> | undefined) => {
-    if (incoming === undefined || Object.keys(incoming).length === 0) return
-    const merged = { ...objectsRef.current, ...incoming }
+    if (incoming === undefined) return
+    // Same "newer wins, equal is untouched" rule the sweep applies, for the same two
+    // reasons: this runs on a timer, so re-storing an identical sidecar would hand every
+    // consumer a fresh `objects` identity (a whole-list re-render) on every tick, and a
+    // page read that started before a newer write must not undo it on arrival.
+    const cur = objectsRef.current
+    const merged = { ...cur }
+    let changed = false
+    for (const [ref, got] of Object.entries(incoming)) {
+      const held = cur[ref]
+      if (held === undefined || Date.parse(got.updated_at) > Date.parse(held.updated_at)) {
+        merged[ref] = got
+        changed = true
+      }
+    }
+    if (!changed) return
     objectsRef.current = merged
     setObjects(merged)
     const entry = cache.get(feedKey) as Entry | undefined
     if (entry !== undefined) setCache({ ...entry, objects: merged })
+  }, [cache, feedKey])
+
+  /**
+   * Land server-side edits to activities ALREADY on screen.
+   *
+   * The head token is written by the fan-out worker and nothing else, so it reports "a
+   * new activity arrived", never "an activity changed". `checkNew` then dedupes page 1 by
+   * id, which drops an edited body as "not new" — so before this, an edit reached an open
+   * feed only through `refresh()`, which resets pagination.
+   *
+   * Swaps bodies IN PLACE. An edit is not an arrival: routing it through `pending` would
+   * park a correction behind a pill the reader has to click, and prepending it would move
+   * a row out from under them.
+   */
+  const reconcileEdits = useCallback((incoming: Activity<TCustom>[]) => {
+    const byId = new Map(incoming.map((a) => [a.id, a]))
+    let changed = false
+    const merged = activitiesRef.current.map((a) => {
+      const got = byId.get(a.id)
+      // `edited_at` is the server's own marker, so comparing it (rather than diffing the
+      // body) is also what keeps an in-flight optimistic `updateActivity` safe: that patch
+      // has not moved the server's `edited_at` yet, so the pre-edit body coming back here
+      // is not mistaken for newer and does not stomp the optimistic value.
+      if (got === undefined || got.edited_at === a.edited_at) return a
+      changed = true
+      return got
+    })
+    if (!changed) return
+    activitiesRef.current = merged
+    setActivities(merged)
+    setCache({
+      activities: merged, next: (cache.get(feedKey) as Entry | undefined)?.next ?? nextRef.current,
+      promoted: promotedRef.current, objects: objectsRef.current,
+    })
   }, [cache, feedKey])
 
   // The fetch itself, with no policy: `loadNext` and `retry` differ only in which guards
@@ -910,6 +977,9 @@ export function useFeed<TCustom = Record<string, unknown>>(
       // changed) while the request was in flight — drop a result that would otherwise
       // write another feed's activities into this (now different) feed's state.
       if (feedKeyRef.current !== feedKey) return
+      // Stamped on every page-1 read, whatever drove it. The revalidate tick reads this
+      // to skip its own read when a head change already fetched the same page seconds ago.
+      lastPageReadAtRef.current = Date.now()
       // The page this call already paid for carries the `objects` sidecar, and objects
       // are the half of a feed that actually changes. Dropping it here was the reason
       // `live: true` delivered no object freshness at all. MERGE, not replace: this is a
@@ -929,6 +999,9 @@ export function useFeed<TCustom = Record<string, unknown>>(
         setNext(page.next)
         return
       }
+      // Edits to rows already on screen land in place, before the id-dedupe below throws
+      // those same rows away as "not new".
+      reconcileEdits(page.results)
       const shown = new Set(cur.map((a) => a.id))
       const buffered = new Set(pendingRef.current.map((a) => a.id))
       const fresh = page.results.filter((r) => !shown.has(r.id) && !buffered.has(r.id))
@@ -946,18 +1019,23 @@ export function useFeed<TCustom = Record<string, unknown>>(
     } catch {
       // Swallowed — see best-effort comment above.
     }
-  }, [client, cache, feedKey, group, id, pageSize, mergeObjects])
+  }, [client, cache, feedKey, group, id, pageSize, mergeObjects, reconcileEdits])
 
-  // ── Object freshness ──────────────────────────────────────────────────────────
-  // The feed head token moves on fan-out, and an object upsert appends no activity, so
-  // no activity-side signal can ever report that an object changed. Activities are
-  // immutable; objects are the mutable half. They therefore get their own read.
+  // ── Revalidation ──────────────────────────────────────────────────────────────
+  // The head token is written by the fan-out worker and by nothing else, so it reports
+  // exactly one event: a new activity arrived. Neither an object upsert nor an activity
+  // PATCH moves it, which leaves BOTH kinds of change invisible to the 5s head check.
+  // Bumping the head on either write is not the answer — an object (and an activity) sits
+  // in N feeds, so that is fan-out on write, N Redis writes per edit.
   //
-  // A `head`-style check (refs in, `updated_at` out) was considered and dropped: the
-  // timestamp lives in the same Postgres row as `custom`, so it is the same scan and the
-  // same row count — it would buy a smaller payload at the cost of a second round trip
-  // on every sweep. One batch read of the whole ref set is cheaper and simpler.
-  const liveObjectsInterval = opts?.liveObjectsInterval ?? 30_000
+  // Instead, one slower tick revalidates what the head cannot report: page 1 (for edits
+  // to rows on screen) and the object refs (for the shared data those rows point at).
+  //
+  // A `head`-style object check (refs in, `updated_at` out) was considered and dropped:
+  // the timestamp lives in the same Postgres row as `custom`, so it is the same scan and
+  // the same row count — it would buy a smaller payload at the cost of a second round
+  // trip on every sweep. One batch read of the whole ref set is cheaper and simpler.
+  const liveRevalidateInterval = opts?.liveRevalidateInterval ?? opts?.liveObjectsInterval ?? 30_000
   const liveObjectsMaxRefs = opts?.liveObjectsMaxRefs ?? DEFAULT_MAX_SWEEP_REFS
 
   // What we held for each swept ref at tick time. Read back when the result lands: a ref
@@ -1012,7 +1090,7 @@ export function useFeed<TCustom = Record<string, unknown>>(
     [cache, feedKey, applySweep],
   )
 
-  const revalidateObjects = useCallback(async () => {
+  const sweepObjects = useCallback(async (minGapMs: number) => {
     if (client === null) return
     // react and @dropinnodex/client version independently: a newer react paired with a
     // client that predates getMany must degrade to activity-only freshness, not throw on
@@ -1026,16 +1104,46 @@ export function useFeed<TCustom = Record<string, unknown>>(
     // moments, so their timers are offset and both would otherwise read the same data
     // seconds apart. The one that skips still receives the other's result.
     await runSweep<TCustom>(
-      cache, feedKey, refs, liveObjectsInterval * 0.9,
+      cache, feedKey, refs, minGapMs,
       (chunk) => client.objects.getMany<TCustom>(chunk, { signal: readSignal() }),
     )
-  }, [client, cache, feedKey, liveObjectsInterval, liveObjectsMaxRefs])
+  }, [client, cache, feedKey, liveObjectsMaxRefs])
+
+  /**
+   * Re-read the objects the shown activities point at, now.
+   *
+   * The imperative half of `live`'s revalidation: use it after a write whose effect lives
+   * on an object rather than on an activity (book the last spot, then show the count the
+   * reader just changed), or behind pull-to-refresh — unlike `refresh()`, it touches no
+   * pagination, so a reader three pages deep keeps all three and sees no spinner.
+   *
+   * Independent of `live`: an app that polls nothing can still call this. It skips the
+   * cross-instance cooldown that gates the timer, but still coalesces with a sweep already
+   * in flight, and resolves only once that sweep's data has been applied.
+   *
+   * No-ops (resolving `undefined`) inside a disabled provider, and against a
+   * `@dropinnodex/client` older than 0.6.0, which has no `objects.getMany`.
+   */
+  const revalidateObjects = useCallback(() => sweepObjects(0), [sweepObjects])
+
+  /**
+   * One tick, both halves of what the head cannot report.
+   *
+   * The page read is skipped when a head change already fetched page 1 within this
+   * interval — a head at 29s and a tick at 30s would otherwise be two reads of the same
+   * page. The object sweep has the same cooldown, applied across hook instances inside
+   * `runSweep`.
+   */
+  const revalidateTick = useCallback(async () => {
+    if (Date.now() - lastPageReadAtRef.current >= liveRevalidateInterval * 0.9) await checkNew()
+    await sweepObjects(liveRevalidateInterval * 0.9)
+  }, [checkNew, sweepObjects, liveRevalidateInterval])
 
   useLiveTicks(
-    opts?.live === true && liveObjectsInterval > 0,
-    () => { void revalidateObjects() },
+    opts?.live === true && liveRevalidateInterval > 0,
+    () => { void revalidateTick() },
     // Guarded above, but never hand setInterval a 0 delay even on an unreachable path.
-    liveObjectsInterval > 0 ? liveObjectsInterval : 30_000,
+    liveRevalidateInterval > 0 ? liveRevalidateInterval : 30_000,
   )
 
   // live: signal-consumption head polling (spec 2026-07-31-live-updates). lastHeadRef is
@@ -1146,6 +1254,9 @@ export function useFeed<TCustom = Record<string, unknown>>(
      *  server sent none — never `undefined`. Resolve an activity's refs against it with
      *  `resolveRefs(activity, objects)`. */
     objects,
+    /** Re-read the shown activities' objects on demand, without touching pagination —
+     *  see the JSDoc above the callback. */
+    revalidateObjects,
     /** Optimistic `custom` patch — see the JSDoc above the callback for the full
      *  reject-after-rollback / onError contract. */
     updateActivity,

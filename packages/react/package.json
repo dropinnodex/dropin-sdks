@@ -1,6 +1,6 @@
 {
   "name": "@dropinnodex/react",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "React hooks for dropin-activity — feeds, reactions, and follows with optimistic updates and rollback.",
   "keywords": [
     "dropin",

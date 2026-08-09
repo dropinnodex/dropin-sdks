@@ -1,5 +1,66 @@
 # @dropinnodex/react
 
+## 0.10.0
+
+### Minor Changes
+
+- 20cc29d: `live: true` now picks up activity edits, not just new activities and object updates.
+
+  The feed head token is written by the fan-out worker and by nothing else, so it reports
+  one event: a new activity arrived. A `PATCH /v1/activities/:id` moves no head, and
+  `checkNew()` then dropped the edited body anyway — it dedupes page 1 by activity id, so a
+  row already on screen was discarded as "not new". An edit reached an open feed only
+  through `refresh()`, which resets pagination.
+
+  Two changes close it:
+
+  - `checkNew()` reconciles edited bodies in place, from the page it had already fetched.
+    Comparison is on `edited_at`, which also keeps an in-flight optimistic `updateActivity`
+    safe — that patch has not moved the server's `edited_at`, so the pre-edit body coming
+    back is not mistaken for newer. Edits never enter the `newCount` buffer and never move
+    a row.
+  - The revalidation tick reads page 1 as well as sweeping objects, so an edit lands without
+    needing a new activity to trigger it. The read is skipped when a head change already
+    fetched the same page within the interval.
+
+  Two limits, both deliberate and both tested. Reconciliation covers the **newest page
+  only**, because that is the page the revalidation reads; objects have no such limit, since
+  a batch read of refs is cheap in a way re-reading N pages is not. And an activity absent
+  from that page is **not** removed — absence cannot distinguish a deletion from a row
+  pushed off page 1 by newer activities. Both land on the next `refresh()`.
+
+  `liveObjectsInterval` is renamed `liveRevalidateInterval` — the tick covers activity edits
+  now, so the old name no longer described it. The old name still works.
+
+  Merging a page's `objects` sidecar also follows the sweep's "newer wins, equal is
+  untouched" rule now, so a revalidation that changes nothing no longer hands consumers a
+  fresh `objects` identity every tick.
+
+- 8eed750: `useFeed` returns `revalidateObjects()` — re-read the shown activities' objects on demand.
+
+  `live: true` already revalidates objects on a timer, but there was no way to ask for it.
+  The only imperative read was `refresh()`, which re-reads page 1 and resets the cursor: a
+  reader three pages deep loses two of them and gets a full-page spinner, which is far too
+  blunt for "the reader just booked a spot, show them the new count". `revalidateObjects()`
+  touches the objects sidecar and nothing else — no pagination, no `isLoadingInitial`.
+
+  Independent of `live`, so an app that polls nothing can still revalidate after its own
+  writes. It reuses the shared per-feed sweep, so two components on one feed still perform
+  one read.
+
+  It skips the cross-instance cooldown that gates the timer. That cooldown exists to stop
+  two offset timers reading the same data seconds apart; a hand call is user intent, not a
+  timer, and returning silently-stale data because a sweep happened three seconds ago is the
+  bug it would otherwise introduce.
+
+  A caller that joins a sweep already in flight now awaits it rather than returning
+  immediately — an awaited `revalidateObjects()` resolves once the data has been applied, so
+  a pull-to-refresh spinner cannot stop before the rows update. This also applies to the
+  timer's own sweeps, which simply resolve later than they used to.
+
+  No-ops resolving `undefined` inside a disabled provider, and against a
+  `@dropinnodex/client` older than 0.6.0, which has no `objects.getMany`.
+
 ## 0.9.0
 
 ### Minor Changes

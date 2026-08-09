@@ -840,3 +840,330 @@ describe('useFeed live: sweep cost and failure handling', () => {
     } finally { vi.useRealTimers() }
   })
 })
+
+// ── Activity edit freshness ─────────────────────────────────────────────────────
+// The head token is written by the fan-out worker and nothing else, so it means "a new
+// activity arrived" — not "something changed". An activity PATCH moves no head, and
+// checkNew's id-dedupe then discards the edited body as "not new". These cover the two
+// halves of the fix: reconciling the bodies checkNew already holds, and firing a page
+// read on the revalidate cadence so it happens without a new activity to trigger it.
+
+describe('checkNew: activity edits', () => {
+  const edited = (id: string, editedAt: string | null, custom: Record<string, unknown>) =>
+    activity(id, [], { edited_at: editedAt, custom })
+
+  it('replaces a shown activity whose edited_at moved', async () => {
+    vi.useFakeTimers()
+    try {
+      const get = vi.fn()
+        .mockResolvedValueOnce({ results: [edited('a1', null, { title: 'Yoga' })], next: null })
+        .mockResolvedValue({ results: [edited('a1', '2026-08-09T10:05:00Z', { title: 'Yoga (moved)' })], next: null })
+      let latest: string | null = null
+      const { client } = liveClient({ get, head: vi.fn(async () => ({ latest })) })
+      const { result } = renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(result.current.activities[0]!.custom).toEqual({ title: 'Yoga' })
+
+      latest = 'a2'
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      expect(result.current.activities[0]!.custom).toEqual({ title: 'Yoga (moved)' })
+      expect(result.current.newCount).toBe(0) // an edit is not a new post
+    } finally { vi.useRealTimers() }
+  })
+
+  // Order is the reader's scroll position. An edit must swap a body in place, never
+  // move the row — that is the whole reason edits are not routed through `pending`.
+  it('keeps list order and identity of untouched rows', async () => {
+    vi.useFakeTimers()
+    try {
+      const first = [edited('a1', null, { n: 1 }), edited('a2', null, { n: 2 })]
+      const get = vi.fn()
+        .mockResolvedValueOnce({ results: first, next: null })
+        .mockResolvedValue({
+          results: [edited('a1', null, { n: 1 }), edited('a2', '2026-08-09T10:05:00Z', { n: 22 })],
+          next: null,
+        })
+      let latest: string | null = null
+      const { client } = liveClient({ get, head: vi.fn(async () => ({ latest })) })
+      const { result } = renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      const a1Before = result.current.activities[0]
+
+      latest = 'x'
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      expect(result.current.activities.map((a) => a.id)).toEqual(['a1', 'a2'])
+      expect(result.current.activities[0]).toBe(a1Before) // untouched row keeps identity
+      expect(result.current.activities[1]!.custom).toEqual({ n: 22 })
+    } finally { vi.useRealTimers() }
+  })
+
+  it('leaves the list alone when no edited_at moved', async () => {
+    vi.useFakeTimers()
+    try {
+      const get = vi.fn(async () => ({ results: [edited('a1', null, { n: 1 })], next: null }))
+      let latest: string | null = null
+      const { client } = liveClient({ get, head: vi.fn(async () => ({ latest })) })
+      const { result } = renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      const before = result.current.activities
+
+      latest = 'x'
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      expect(result.current.activities).toBe(before) // no new array, so no re-render
+    } finally { vi.useRealTimers() }
+  })
+
+  // An in-flight optimistic patch has not moved the server's edited_at yet, so the
+  // reconcile must not treat the server's pre-edit body as newer and stomp it.
+  it('does not clobber an in-flight optimistic updateActivity', async () => {
+    vi.useFakeTimers()
+    try {
+      let release!: () => void
+      const gate = new Promise<void>((r) => { release = r })
+      const get = vi.fn(async () => ({ results: [edited('a1', null, { title: 'server' })], next: null }))
+      const updateActivity = vi.fn(async () => { await gate; return edited('a1', '2026-08-09T11:00:00Z', { title: 'mine' }) })
+      let latest: string | null = null
+      const { client } = liveClient({ get, head: vi.fn(async () => ({ latest })) })
+      ;(client.feed as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+        get, head: vi.fn(async () => ({ latest })), updateActivity,
+      }))
+      const { result } = renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+
+      act(() => { void result.current.updateActivity('a1', { set: { 'custom.title': 'mine' } }) })
+      expect(result.current.activities[0]!.custom).toEqual({ title: 'mine' })
+
+      latest = 'x'
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      expect(result.current.activities[0]!.custom).toEqual({ title: 'mine' }) // optimistic value survives
+
+      await act(async () => { release(); await vi.advanceTimersByTimeAsync(0) })
+      expect(result.current.activities[0]!.custom).toEqual({ title: 'mine' })
+    } finally { vi.useRealTimers() }
+  })
+})
+
+describe('useFeed live: revalidate cadence', () => {
+  it('reads page 1 on the revalidate tick even though no head moved', async () => {
+    vi.useFakeTimers()
+    try {
+      const get = vi.fn()
+        .mockResolvedValueOnce({ results: [activity('a1', [], { edited_at: null, custom: { n: 1 } })], next: null })
+        .mockResolvedValue({
+          results: [activity('a1', [], { edited_at: '2026-08-09T10:05:00Z', custom: { n: 2 } })], next: null,
+        })
+      // head never moves — this is the gap: an edit is invisible to the 5s signal.
+      const { client } = liveClient({ get, head: vi.fn(async () => ({ latest: null })) })
+      const { result } = renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(20_000) })
+      expect(get).toHaveBeenCalledTimes(1) // head ticks alone never read the page
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+      expect(get).toHaveBeenCalledTimes(2)
+      expect(result.current.activities[0]!.custom).toEqual({ n: 2 })
+    } finally { vi.useRealTimers() }
+  })
+
+  // A head change at 29s and a cadence tick at 30s must not both read page 1.
+  it('skips the cadence read when checkNew already read the page just now', async () => {
+    vi.useFakeTimers()
+    try {
+      const get = vi.fn(async () => ({ results: [activity('a1')], next: null }))
+      let latest: string | null = null
+      const { client } = liveClient({ get, head: vi.fn(async () => ({ latest })) })
+      renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+
+      latest = 'moved'
+      await act(async () => { await vi.advanceTimersByTimeAsync(25_000) }) // head consumed → 1 page read
+      expect(get).toHaveBeenCalledTimes(2)
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) }) // cadence tick lands right after
+      expect(get).toHaveBeenCalledTimes(2) // cooled down, not re-read
+    } finally { vi.useRealTimers() }
+  })
+
+  it('liveRevalidateInterval retimes both the page read and the object sweep', async () => {
+    vi.useFakeTimers()
+    try {
+      const { client, get, getMany } = liveClient()
+      renderHook(
+        () => useFeed('user', 'alice', { live: true, liveRevalidateInterval: 10_000 }),
+        { wrapper: wrapper(client) },
+      )
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+      expect(get).toHaveBeenCalledTimes(2)
+      expect(getMany).toHaveBeenCalledTimes(1)
+    } finally { vi.useRealTimers() }
+  })
+
+  it('liveObjectsInterval still works as the deprecated alias', async () => {
+    vi.useFakeTimers()
+    try {
+      const { client, get, getMany } = liveClient()
+      renderHook(
+        () => useFeed('user', 'alice', { live: true, liveObjectsInterval: 10_000 }),
+        { wrapper: wrapper(client) },
+      )
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+      expect(get).toHaveBeenCalledTimes(2)
+      expect(getMany).toHaveBeenCalledTimes(1)
+    } finally { vi.useRealTimers() }
+  })
+
+  it('0 disables the cadence entirely, leaving the 5s head check alone', async () => {
+    vi.useFakeTimers()
+    try {
+      const { client, get, getMany, head } = liveClient()
+      renderHook(
+        () => useFeed('user', 'alice', { live: true, liveRevalidateInterval: 0 }),
+        { wrapper: wrapper(client) },
+      )
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
+      expect(get).toHaveBeenCalledTimes(1)
+      expect(getMany).not.toHaveBeenCalled()
+      expect(head.mock.calls.length).toBeGreaterThan(0)
+    } finally { vi.useRealTimers() }
+  })
+})
+
+// The imperative half of the same machinery. The timer answers "keep it fresh in the
+// background"; this answers "the reader just did something, show them the truth NOW".
+describe('useFeed: revalidateObjects()', () => {
+  it('re-reads the shown refs on demand and applies what moved', async () => {
+    const getMany = vi.fn(async () => ({
+      'session:1': obj('session', '1', { spots_left: 0 }, '2026-08-09T11:00:00Z'),
+    }))
+    const { client } = liveClient({ getMany })
+    const { result } = renderHook(() => useFeed('user', 'alice'), { wrapper: wrapper(client) })
+    await waitFor(() => expect(result.current.isLoading).toBe(false))
+
+    await act(async () => { await result.current.revalidateObjects() })
+    expect(getMany).toHaveBeenCalledTimes(1)
+    expect(getMany.mock.calls[0]![0]).toEqual(['session:1'])
+    expect(result.current.objects['session:1']!.custom).toEqual({ spots_left: 0 })
+  })
+
+  // Works WITHOUT `live` — the whole point for an app that polls nothing and only
+  // revalidates after its own writes (book a spot, then show the new count).
+  it('does not require live: true', async () => {
+    const { client, getMany, head } = liveClient()
+    const { result } = renderHook(() => useFeed('user', 'alice'), { wrapper: wrapper(client) })
+    await waitFor(() => expect(result.current.isLoading).toBe(false))
+
+    await act(async () => { await result.current.revalidateObjects() })
+    expect(getMany).toHaveBeenCalledTimes(1)
+    expect(head).not.toHaveBeenCalled()
+  })
+
+  // The cross-instance cooldown exists to stop two offset TIMERS reading the same data
+  // seconds apart. A hand call is user intent, not a timer, and silently returning stale
+  // data because a sweep happened 3s ago is the bug this guards against.
+  it('bypasses the sweep cooldown that gates the timer', async () => {
+    vi.useFakeTimers()
+    try {
+      const getMany = vi.fn(async () => ({
+        'session:1': obj('session', '1', { spots_left: 2 }, '2026-08-09T11:00:00Z'),
+      }))
+      const { client } = liveClient({ getMany })
+      const { result } = renderHook(
+        () => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) },
+      )
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
+      expect(getMany).toHaveBeenCalledTimes(1) // the timer's sweep, just now
+
+      await act(async () => { await result.current.revalidateObjects() })
+      expect(getMany).toHaveBeenCalledTimes(2)
+    } finally { vi.useRealTimers() }
+  })
+
+  // Two components on one feed: the second caller must resolve AFTER the shared read has
+  // landed, not immediately. An awaited call that returns before the data arrives is a
+  // pull-to-refresh spinner that stops too early.
+  it('awaits an in-flight sweep instead of returning early', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((r) => { release = r })
+    const getMany = vi.fn(async () => {
+      await gate
+      return { 'session:1': obj('session', '1', { spots_left: 7 }, '2026-08-09T11:00:00Z') }
+    })
+    const { client } = liveClient({ getMany })
+    const { result } = renderHook(() => useFeed('user', 'alice'), { wrapper: wrapper(client) })
+    await waitFor(() => expect(result.current.isLoading).toBe(false))
+
+    let secondDone = false
+    await act(async () => {
+      const first = result.current.revalidateObjects()
+      const second = result.current.revalidateObjects().then(() => { secondDone = true })
+      expect(secondDone).toBe(false)
+      release()
+      await Promise.all([first, second])
+    })
+    expect(getMany).toHaveBeenCalledTimes(1) // coalesced, not doubled
+    expect(secondDone).toBe(true)
+    expect(result.current.objects['session:1']!.custom).toEqual({ spots_left: 7 })
+  })
+
+  it('is inert inside a disabled provider', async () => {
+    const { client, getMany } = liveClient()
+    const { result } = renderHook(() => useFeed('user', 'alice'), {
+      wrapper: ({ children }: { children: React.ReactNode }) =>
+        <DropInProvider client={client as never} enabled={false}>{children}</DropInProvider>,
+    })
+    await expect(result.current.revalidateObjects()).resolves.toBeUndefined()
+    expect(getMany).not.toHaveBeenCalled()
+  })
+
+  // react and @dropinnodex/client version independently. A hand call against a client
+  // that predates getMany must be a no-op, not a TypeError in the app's click handler.
+  it('no-ops against a client without objects.getMany', async () => {
+    const client = makeClient()
+    const { result } = renderHook(() => useFeed('user', 'alice'), { wrapper: wrapper(client) })
+    await waitFor(() => expect(result.current.isLoading).toBe(false))
+    await expect(result.current.revalidateObjects()).resolves.toBeUndefined()
+  })
+})
+
+describe('checkNew: the two documented limits of edit reconciliation', () => {
+  // Reconciliation reads page 1, so it can only ever see page 1. Re-reading every loaded
+  // page each tick is the cost this deliberately does not pay — put the changing, shared
+  // part of a card in an object and the sweep covers it at any depth.
+  it('does not reconcile an edit to an activity on a deeper page', async () => {
+    vi.useFakeTimers()
+    try {
+      const get = vi.fn()
+        .mockResolvedValueOnce({ results: [activity('a1', [], { edited_at: null, custom: { n: 1 } })], next: 'cur1' })
+        .mockResolvedValueOnce({ results: [activity('a2', [], { edited_at: null, custom: { n: 2 } })], next: null })
+        // page 1 again — a2 is not on it, so its edit is invisible here
+        .mockResolvedValue({ results: [activity('a1', [], { edited_at: null, custom: { n: 1 } })], next: 'cur1' })
+      const { client } = liveClient({ get, head: vi.fn(async () => ({ latest: null })) })
+      const { result } = renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await result.current.loadNext() })
+      expect(result.current.activities.map((a) => a.id)).toEqual(['a1', 'a2'])
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
+      expect(result.current.activities[1]!.custom).toEqual({ n: 2 }) // untouched, by design
+    } finally { vi.useRealTimers() }
+  })
+
+  // Absence from page 1 cannot distinguish "deleted" from "pushed off page 1 by newer
+  // activities" — the object sweep can make that call because it asks for specific refs.
+  it('does not drop an activity merely absent from the page-1 read', async () => {
+    vi.useFakeTimers()
+    try {
+      const get = vi.fn()
+        .mockResolvedValueOnce({ results: [activity('a1'), activity('a2')], next: null })
+        .mockResolvedValue({ results: [activity('a1')], next: null })
+      const { client } = liveClient({ get, head: vi.fn(async () => ({ latest: null })) })
+      const { result } = renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
+      expect(result.current.activities.map((a) => a.id)).toEqual(['a1', 'a2'])
+    } finally { vi.useRealTimers() }
+  })
+})
