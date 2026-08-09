@@ -455,3 +455,388 @@ describe('updateActivity — prototype pollution guard', () => {
     expect(({} as Record<string, unknown>).polluted).toBeUndefined()
   })
 })
+
+// ── Object freshness ────────────────────────────────────────────────────────────
+// Activities are immutable, objects are not — so the feed head token (which only moves
+// on fan-out) can never be the freshness signal for the mutable half. These cover the
+// two paths that keep the sidecar current: checkNew merging the page it already fetched,
+// and the `live` object sweep re-reading refs in one batch request.
+
+const obj = (type: string, id: string, custom: Record<string, unknown>, updated_at: string): DropInObject => ({
+  type, id, custom, updated_at,
+})
+
+/** A live-capable client: mount page, head, and a batch object read. */
+function liveClient(over: {
+  get?: ReturnType<typeof vi.fn>
+  head?: ReturnType<typeof vi.fn>
+  getMany?: ReturnType<typeof vi.fn>
+} = {}) {
+  const get = over.get ?? vi.fn(async () => ({
+    results: [activity('a1', ['session:1'])],
+    next: null,
+    objects: { 'session:1': obj('session', '1', { spots_left: 4 }, '2026-08-09T10:00:00Z') },
+  }))
+  const head = over.head ?? vi.fn(async () => ({ latest: null }))
+  const getMany = over.getMany ?? vi.fn(async () => ({}))
+  return { client: makeClient({ feed: vi.fn(() => ({ get, head })), objects: { getMany } }), get, head, getMany }
+}
+
+describe('checkNew: objects sidecar', () => {
+  it('merges the objects it already fetched instead of discarding them', async () => {
+    vi.useFakeTimers()
+    try {
+      const get = vi.fn()
+        .mockResolvedValueOnce({
+          results: [activity('a1', ['session:1'])], next: null,
+          objects: { 'session:1': obj('session', '1', { spots_left: 4 }, '2026-08-09T10:00:00Z') },
+        })
+        // checkNew's page: no new activity, but the object moved. Before this fix the
+        // whole sidecar was dropped on the floor and the card stayed at 4.
+        .mockResolvedValue({
+          results: [activity('a1', ['session:1'])], next: null,
+          objects: { 'session:1': obj('session', '1', { spots_left: 1 }, '2026-08-09T10:05:00Z') },
+        })
+      let latest: string | null = null
+      const { client } = liveClient({ get, head: vi.fn(async () => ({ latest })) })
+      const { result } = renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(result.current.objects['session:1']!.custom).toEqual({ spots_left: 4 })
+
+      latest = 'a2'
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      expect(result.current.objects['session:1']!.custom).toEqual({ spots_left: 1 })
+    } finally { vi.useRealTimers() }
+  })
+
+  // MERGE, not replace: checkNew reads page 1 only, so replacing would blank every card
+  // resolved off page 2+ for a reader who has scrolled.
+  it('merges rather than replacing — a deeper page’s objects survive', async () => {
+    vi.useFakeTimers()
+    try {
+      const get = vi.fn()
+        .mockResolvedValueOnce({
+          results: [activity('a1', ['session:1'])], next: 'cur1',
+          objects: { 'session:1': obj('session', '1', {}, '2026-08-09T10:00:00Z') },
+        })
+        .mockResolvedValueOnce({
+          results: [activity('a2', ['session:2'])], next: null,
+          objects: { 'session:2': obj('session', '2', {}, '2026-08-09T10:00:00Z') },
+        })
+        .mockResolvedValue({
+          results: [activity('a1', ['session:1'])], next: 'cur1',
+          objects: { 'session:1': obj('session', '1', { moved: true }, '2026-08-09T10:05:00Z') },
+        })
+      let latest: string | null = null
+      const { client } = liveClient({ get, head: vi.fn(async () => ({ latest })) })
+      const { result } = renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await result.current.loadNext() })
+      expect(Object.keys(result.current.objects).sort()).toEqual(['session:1', 'session:2'])
+
+      latest = 'a3'
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      expect(result.current.objects['session:1']!.custom).toEqual({ moved: true })
+      expect(result.current.objects['session:2']).toBeDefined()
+    } finally { vi.useRealTimers() }
+  })
+})
+
+describe('useFeed live: object sweep', () => {
+  it('batch-re-reads the shown refs on its own cadence and applies what moved', async () => {
+    vi.useFakeTimers()
+    try {
+      const getMany = vi.fn(async () => ({
+        'session:1': obj('session', '1', { spots_left: 0 }, '2026-08-09T11:00:00Z'),
+      }))
+      const { client, getMany: gm } = liveClient({ getMany })
+      const { result } = renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(gm).not.toHaveBeenCalled()
+
+      // Activity head ticks at 5s must NOT drag the object sweep along with them.
+      await act(async () => { await vi.advanceTimersByTimeAsync(20_000) })
+      expect(gm).not.toHaveBeenCalled()
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+      expect(gm).toHaveBeenCalledTimes(1)
+      expect(gm.mock.calls[0]![0]).toEqual(['session:1'])
+      expect(result.current.objects['session:1']!.custom).toEqual({ spots_left: 0 })
+    } finally { vi.useRealTimers() }
+  })
+
+  // Overlay-always-wins is the bug this avoids: a sweep that started before a refresh
+  // must not pin the card back to the older read when it lands after it.
+  it('newest updated_at wins — a stale sweep response never overwrites a fresher one', async () => {
+    vi.useFakeTimers()
+    try {
+      const getMany = vi.fn(async () => ({
+        'session:1': obj('session', '1', { spots_left: 9 }, '2026-08-09T09:00:00Z'), // OLDER than mount
+      }))
+      const { client } = liveClient({ getMany })
+      const { result } = renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
+      expect(result.current.objects['session:1']!.custom).toEqual({ spots_left: 4 })
+    } finally { vi.useRealTimers() }
+  })
+
+  it('keeps the same object identity when nothing moved, so the list does not re-render', async () => {
+    vi.useFakeTimers()
+    try {
+      const getMany = vi.fn(async () => ({
+        'session:1': obj('session', '1', { spots_left: 4 }, '2026-08-09T10:00:00Z'), // same updated_at
+      }))
+      const { client } = liveClient({ getMany })
+      const { result } = renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      const before = result.current.objects
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
+      expect(result.current.objects).toBe(before)
+    } finally { vi.useRealTimers() }
+  })
+
+  // A ref we asked for and did not get back was deleted server-side. Keeping it would
+  // render a cancelled session forever; the sidecar contract is fall back to the
+  // activity's own custom.
+  it('drops an object the sweep asked for and did not get back', async () => {
+    vi.useFakeTimers()
+    try {
+      const { client } = liveClient({ getMany: vi.fn(async () => ({})) })
+      const { result } = renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(result.current.objects['session:1']).toBeDefined()
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
+      expect(result.current.objects['session:1']).toBeUndefined()
+    } finally { vi.useRealTimers() }
+  })
+
+  it('costs no request when the page renders no refs', async () => {
+    vi.useFakeTimers()
+    try {
+      const { client, getMany } = liveClient({
+        get: vi.fn(async () => ({ results: [activity('a1')], next: null })),
+      })
+      renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
+      expect(getMany).not.toHaveBeenCalled()
+    } finally { vi.useRealTimers() }
+  })
+
+  it('deduplicates refs shared by several activities into one key', async () => {
+    vi.useFakeTimers()
+    try {
+      const { client, getMany } = liveClient({
+        get: vi.fn(async () => ({
+          results: [activity('a1', ['session:1']), activity('a2', ['session:1', 'venue:9'])],
+          next: null,
+          objects: { 'session:1': obj('session', '1', {}, '2026-08-09T10:00:00Z') },
+        })),
+      })
+      renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
+      expect(getMany.mock.calls[0]![0]).toEqual(['session:1', 'venue:9'])
+    } finally { vi.useRealTimers() }
+  })
+
+  // The server caps one request at 100 refs. A deep-scrolled feed exceeds that, and a
+  // silent slice would leave every card past the first 100 refs permanently stale.
+  it('chunks past the 100-ref request cap instead of dropping the tail', async () => {
+    vi.useFakeTimers()
+    try {
+      const many = Array.from({ length: 150 }, (_, i) => activity(`a${i}`, [`session:${i}`]))
+      const { client, getMany } = liveClient({
+        get: vi.fn(async () => ({ results: many, next: null, objects: {} })),
+      })
+      renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
+      expect(getMany).toHaveBeenCalledTimes(2)
+      expect((getMany.mock.calls[0]![0] as string[]).length).toBe(100)
+      expect((getMany.mock.calls[1]![0] as string[]).length).toBe(50)
+    } finally { vi.useRealTimers() }
+  })
+
+  it('liveObjectsInterval: 0 disables the sweep and leaves activity freshness alone', async () => {
+    vi.useFakeTimers()
+    try {
+      const { client, getMany, head } = liveClient()
+      renderHook(() => useFeed('user', 'alice', { live: true, liveObjectsInterval: 0 }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
+      expect(getMany).not.toHaveBeenCalled()
+      expect(head.mock.calls.length).toBeGreaterThan(0)
+    } finally { vi.useRealTimers() }
+  })
+
+  it('never sweeps without live — the sweep is part of what live means, not a separate opt-in', async () => {
+    vi.useFakeTimers()
+    try {
+      const { client, getMany } = liveClient()
+      renderHook(() => useFeed('user', 'alice'), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
+      expect(getMany).not.toHaveBeenCalled()
+    } finally { vi.useRealTimers() }
+  })
+
+  it('swallows sweep errors — best-effort, like every other unattended tick', async () => {
+    vi.useFakeTimers()
+    try {
+      const { client } = liveClient({ getMany: vi.fn(async () => { throw new Error('boom') }) })
+      const { result } = renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
+      expect(result.current.error).toBeNull()
+      expect(result.current.objects['session:1']).toBeDefined() // untouched, not dropped
+    } finally { vi.useRealTimers() }
+  })
+
+  // react and client version independently, so a newer react paired with a client that
+  // predates getMany must degrade to "activities only", not crash every 30s.
+  it('degrades quietly against a client with no objects.getMany', async () => {
+    vi.useFakeTimers()
+    try {
+      const get = vi.fn(async () => ({
+        results: [activity('a1', ['session:1'])], next: null,
+        objects: { 'session:1': obj('session', '1', { spots_left: 4 }, '2026-08-09T10:00:00Z') },
+      }))
+      const client = makeClient({ feed: vi.fn(() => ({ get, head: vi.fn(async () => ({ latest: null })) })) })
+      const { result } = renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
+      expect(result.current.error).toBeNull()
+      expect(result.current.objects['session:1']).toBeDefined()
+    } finally { vi.useRealTimers() }
+  })
+})
+
+describe('useFeed live: sweep cost and failure handling', () => {
+  const manyActivities = (n: number) => Array.from({ length: n }, (_, i) => activity(`a${i}`, [`session:${i}`]))
+
+  it('caps the sweep at liveObjectsMaxRefs and says so once, rather than truncating silently', async () => {
+    vi.useFakeTimers()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const { client, getMany } = liveClient({
+        get: vi.fn(async () => ({ results: manyActivities(250), next: null, objects: {} })),
+      })
+      renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
+      // 250 refs on screen, default ceiling 200 → two requests, not three.
+      expect(getMany).toHaveBeenCalledTimes(2)
+      const asked = getMany.mock.calls.flatMap((c) => c[0] as string[])
+      expect(asked.length).toBe(200)
+      expect(asked).toContain('session:0') // newest kept
+      expect(asked).not.toContain('session:249') // tail dropped
+      expect(warn).toHaveBeenCalledTimes(1)
+      expect(String(warn.mock.calls[0]![0])).toContain('liveObjectsMaxRefs')
+
+      // Warned once per feed, not once per tick.
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
+      expect(warn).toHaveBeenCalledTimes(1)
+    } finally { warn.mockRestore(); vi.useRealTimers() }
+  })
+
+  it('raising liveObjectsMaxRefs buys more coverage', async () => {
+    vi.useFakeTimers()
+    try {
+      const { client, getMany } = liveClient({
+        get: vi.fn(async () => ({ results: manyActivities(250), next: null, objects: {} })),
+      })
+      renderHook(() => useFeed('user', 'alice', { live: true, liveObjectsMaxRefs: 300 }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
+      expect(getMany).toHaveBeenCalledTimes(3)
+      expect(getMany.mock.calls.flatMap((c) => c[0] as string[]).length).toBe(250)
+    } finally { vi.useRealTimers() }
+  })
+
+  // A chunk tells us nothing about refs it did not cover. Treating "no answer" as
+  // "deleted" would drop live objects whenever one request of a sweep failed.
+  it('keeps a failed chunk’s objects and still applies the chunk that succeeded', async () => {
+    vi.useFakeTimers()
+    try {
+      const getMany = vi.fn()
+        .mockResolvedValueOnce({ 'session:0': obj('session', '0', { spots_left: 1 }, '2026-08-09T11:00:00Z') })
+        .mockRejectedValueOnce(new Error('gateway timeout'))
+      const { client } = liveClient({
+        get: vi.fn(async () => ({
+          results: manyActivities(150), next: null,
+          objects: {
+            'session:0': obj('session', '0', { spots_left: 4 }, '2026-08-09T10:00:00Z'),
+            'session:120': obj('session', '120', { spots_left: 2 }, '2026-08-09T10:00:00Z'),
+          },
+        })),
+        getMany,
+      })
+      const { result } = renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
+      expect(result.current.objects['session:0']!.custom).toEqual({ spots_left: 1 }) // chunk 1 applied
+      expect(result.current.objects['session:120']).toBeDefined() // chunk 2 unknown, not deleted
+      expect(result.current.error).toBeNull()
+    } finally { vi.useRealTimers() }
+  })
+
+  it('two hooks on the same feed share ONE sweep, and both get the result', async () => {
+    vi.useFakeTimers()
+    try {
+      const { client, getMany } = liveClient({
+        getMany: vi.fn(async () => ({ 'session:1': obj('session', '1', { spots_left: 0 }, '2026-08-09T11:00:00Z') })),
+      })
+      const { result } = renderHook(
+        () => ({
+          a: useFeed('user', 'alice', { live: true }),
+          b: useFeed('user', 'alice', { live: true }),
+        }),
+        { wrapper: wrapper(client) },
+      )
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
+      expect(getMany).toHaveBeenCalledTimes(1) // not once per mounted hook
+      expect(result.current.a.objects['session:1']!.custom).toEqual({ spots_left: 0 })
+      expect(result.current.b.objects['session:1']!.custom).toEqual({ spots_left: 0 })
+    } finally { vi.useRealTimers() }
+  })
+
+  // The synthetic version of this only proved the comparison. This one actually
+  // interleaves: the sweep is in flight, a refresh lands with newer data, THEN the sweep
+  // answers with what it read before that refresh.
+  it('a refresh landing mid-sweep wins — the sweep cannot pin the card back', async () => {
+    vi.useFakeTimers()
+    try {
+      let releaseSweep!: (v: Record<string, DropInObject>) => void
+      const getMany = vi.fn(() => new Promise<Record<string, DropInObject>>((res) => { releaseSweep = res }))
+      const get = vi.fn()
+        .mockResolvedValueOnce({
+          results: [activity('a1', ['session:1'])], next: null,
+          objects: { 'session:1': obj('session', '1', { spots_left: 4 }, '2026-08-09T10:00:00Z') },
+        })
+        // refresh(): newer than anything the in-flight sweep can be holding
+        .mockResolvedValue({
+          results: [activity('a1', ['session:1'])], next: null,
+          objects: { 'session:1': obj('session', '1', { spots_left: 1 }, '2026-08-09T10:10:00Z') },
+        })
+      const { client } = liveClient({ get, getMany })
+      const { result } = renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
+      expect(getMany).toHaveBeenCalledTimes(1) // in flight, unresolved
+
+      await act(async () => { await result.current.refresh() })
+      expect(result.current.objects['session:1']!.custom).toEqual({ spots_left: 1 })
+
+      // The sweep now answers with the state it read BEFORE the refresh.
+      await act(async () => {
+        releaseSweep({ 'session:1': obj('session', '1', { spots_left: 3 }, '2026-08-09T10:05:00Z') })
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      expect(result.current.objects['session:1']!.custom).toEqual({ spots_left: 1 })
+    } finally { vi.useRealTimers() }
+  })
+})

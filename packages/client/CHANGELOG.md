@@ -1,5 +1,42 @@
 # @dropinnodex/client
 
+## 0.6.0
+
+### Minor Changes
+
+- e08ed31: Object freshness: `live: true` now keeps objects current, not just activities.
+
+  Activities are immutable and objects are the half of a feed that moves, but the only
+  freshness signal was the feed head token — which advances on fan-out, so an object
+  upsert never moved it. `live: true` therefore delivered no object freshness at all.
+
+  - **client / server**: new `objects.getMany(refs)` — re-read up to 100 objects in one
+    request, keyed `type:id`. Backs `GET /v1/objects?refs=…`. Missing refs are absent from
+    the map rather than a 404, matching the feed-read sidecar. An empty list costs zero
+    requests.
+  - **react**: under `live: true`, `useFeed` re-reads the objects on screen every 30s
+    (visibility-gated, like the 5s activity head check). Tune with the new
+    `liveObjectsInterval`, or pass `0` to keep activity freshness without the object sweep.
+    Newest `updated_at` wins, so a sweep landing after a `refresh()` cannot pin a card back
+    to an older read, and an unchanged object keeps its identity rather than re-rendering
+    the list every interval.
+  - **react**: the sweep is bounded at `liveObjectsMaxRefs` refs per tick (default 200, two
+    requests), newest activities first, with one console warning when a deeper feed exceeds
+    it — a deeply scrolled feed stays cheap instead of billing a request per 100 refs
+    forever. Several `useFeed`s on the same feed share one sweep rather than one each, and
+    a chunk that fails no longer discards the chunks that succeeded or drops the objects it
+    could not check.
+  - **react**: `checkNew()` now merges the `objects` sidecar from the page it already
+    fetched instead of discarding it.
+
+  Server-side, `updated_at` now advances by at least a millisecond on every object write.
+  It is the freshness token every client diffs on, and it reaches them at millisecond
+  precision — so two writes inside one millisecond previously produced identical tokens and
+  the second silently never reached a client holding the first.
+
+  This replaces hand-rolled per-card `objects.get()` polling with one batch request on a
+  cadence that matches how often objects actually change.
+
 ## 0.5.0
 
 ### Minor Changes

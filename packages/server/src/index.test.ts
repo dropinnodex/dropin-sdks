@@ -532,6 +532,28 @@ describe('objects and patch', () => {
     ])
   })
 
+  it('batch-reads objects with one repeated refs param per ref', async () => {
+    const { server, fetchMock } = recordingServer()
+    await server.objects.getMany(['session:1', 'venue:9'])
+    expect(new URL(fetchMock.mock.calls[0]![0] as string).search)
+      .toBe('?refs=session%3A1&refs=venue%3A9')
+  })
+
+  // Repeated rather than comma-joined: `type:id` constrains colons, not commas, so
+  // joining would shred an id containing one into two refs that match nothing.
+  it('keeps a comma inside an id intact', async () => {
+    const { server, fetchMock } = recordingServer()
+    await server.objects.getMany(['venue:north,south'])
+    expect(new URL(fetchMock.mock.calls[0]![0] as string).search)
+      .toBe('?refs=venue%3Anorth%2Csouth')
+  })
+
+  it('short-circuits an empty ref list without a request', async () => {
+    const { server, fetchMock } = recordingServer()
+    await expect(server.objects.getMany([])).resolves.toEqual({})
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
   it('patches an activity', async () => {
     const { server, calls } = recordingServer()
     await server.activities.patch('a1', { set: { 'custom.title': 'fixed' } })

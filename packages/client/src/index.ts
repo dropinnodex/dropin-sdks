@@ -393,6 +393,31 @@ export class DropInClient {
         undefined,
         opts,
       ),
+    /**
+     * Re-read up to 100 objects in ONE request, keyed by `type:id`. This is how a
+     * rendered page revalidates its `objects` sidecar: `get()` per card is N requests
+     * for N cards, and objects are the mutable half of a feed, so that sweep repeats.
+     *
+     * Refs with no stored object are absent from the map — the same contract as the
+     * feed-read sidecar, so a deleted object never fails the sweep. Compare each
+     * returned `updated_at` against what you hold and re-render only what moved.
+     *
+     * An empty list costs zero requests rather than a 400: a page that renders no refs
+     * is a normal state, not a caller error.
+     */
+    getMany: async <TCustom = Record<string, unknown>>(
+      refs: string[], opts: RequestOptions = {},
+    ): Promise<Record<string, DropInObject<TCustom>>> => {
+      if (refs.length === 0) return {}
+      // Repeated `refs=` rather than one comma-joined value: a ref is `type:id`, which
+      // forbids a colon in each half but permits a comma anywhere, so joining would
+      // shred such an id. URLSearchParams.append (not this.qs's `set`) keeps repeats.
+      const search = new URLSearchParams()
+      for (const ref of refs) search.append('refs', ref)
+      return this.call<Record<string, DropInObject<TCustom>>>(
+        'GET', `/v1/objects?${search.toString()}`, undefined, opts,
+      )
+    },
   }
 
   readonly users = {

@@ -331,6 +331,32 @@ export class DropInServer {
     get: async <TCustom = Record<string, unknown>>(type: string, id: string, opts: RequestOptions = {}) =>
       this.call<DropInObject<TCustom>>('GET', objectPath(type, id), undefined, opts),
 
+    /**
+     * Read up to 100 objects in ONE request, keyed `type:id`. Mirrors
+     * `@dropinnodex/client`'s `objects.getMany` — the same route, so a server-side
+     * revalidation (a cache warm, a webhook handler checking what moved) costs one
+     * request rather than one per object.
+     *
+     * Refs with no stored object are absent from the map rather than an error, matching
+     * the feed-read `objects` sidecar. An empty list costs zero requests.
+     *
+     * @example
+     * const fresh = await dropin.objects.getMany(['session:1234', 'session:5678'])
+     * fresh['session:1234']?.custom.spots_left
+     */
+    getMany: async <TCustom = Record<string, unknown>>(
+      refs: string[], opts: RequestOptions = {},
+    ): Promise<Record<string, DropInObject<TCustom>>> => {
+      if (refs.length === 0) return {}
+      // Repeated `refs=` rather than one comma-joined value: a ref is `type:id`, which
+      // constrains colons but not commas, so joining would shred an id containing one.
+      const search = new URLSearchParams()
+      for (const ref of refs) search.append('refs', ref)
+      return this.call<Record<string, DropInObject<TCustom>>>(
+        'GET', `/v1/objects?${search.toString()}`, undefined, opts,
+      )
+    },
+
     remove: async (type: string, id: string, opts: RequestOptions = {}) =>
       this.call<void>('DELETE', objectPath(type, id), undefined, opts),
   }

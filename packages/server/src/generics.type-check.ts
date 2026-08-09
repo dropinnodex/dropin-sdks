@@ -65,6 +65,11 @@ async function _check(s: DropInServer) {
   const gotObj: DropInObject<{ spots_left: number }> = await s.objects.get<{ spots_left: number }>('session', '1234')
   void gotObj.custom.spots_left
 
+  // getMany carries the same custom generic through, keyed by ref. Indexing yields
+  // `| undefined` — a ref with no stored object is absent from the map, never a hole.
+  const manyObjs = await s.objects.getMany<{ spots_left: number }>(['session:1234'])
+  void manyObjs['session:1234']?.custom.spots_left
+
   // Mismatched custom shape must not compile.
   await s.objects.upsert<{ spots_left: number }>(
     'session', '1234',

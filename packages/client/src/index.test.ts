@@ -456,7 +456,44 @@ describe('objects', () => {
     expect(objects).not.toHaveProperty('remove')
     expect(objects).not.toHaveProperty('set')
     expect(objects).not.toHaveProperty('delete')
-    expect(Object.keys(objects)).toEqual(['get'])
+    expect(Object.keys(objects)).toEqual(['get', 'getMany'])
+  })
+})
+
+describe('objects.getMany', () => {
+  it('sends one repeated refs param per ref and returns the map', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, {
+      'session:1': { type: 'session', id: '1', custom: { spots_left: 2 }, updated_at: '2026-08-09T00:00:00Z' },
+    }))
+    const res = await client(async () => 'tok').objects.getMany(['session:1', 'venue:9'])
+    expect(callAt(0)[1].method).toBe('GET')
+    expect(lastUrl()).toBe('http://api.test/v1/objects?refs=session%3A1&refs=venue%3A9')
+    expect(res['session:1']?.custom).toEqual({ spots_left: 2 })
+  })
+
+  // Repeated params rather than a comma-joined list exist precisely for this: `type:id`
+  // forbids a colon in each half but says nothing about commas, and joining would shred
+  // such an id into two refs that match nothing.
+  it('keeps a comma inside an id intact', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, {}))
+    await client(async () => 'tok').objects.getMany(['venue:north,south'])
+    expect(lastUrl()).toBe('http://api.test/v1/objects?refs=venue%3Anorth%2Csouth')
+  })
+
+  // A sweep over a page that happens to render no refs must cost zero requests, not a
+  // guaranteed 400 from the server's `min(1)`.
+  it('short-circuits an empty ref list without a request', async () => {
+    const res = await client(async () => 'tok').objects.getMany([])
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(res).toEqual({})
+  })
+
+  it('forwards the abort signal', async () => {
+    const ctrl = new AbortController()
+    ctrl.abort()
+    await expect(client(async () => 'tok').objects.getMany(['session:1'], { signal: ctrl.signal }))
+      .rejects.toThrow()
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 })
 

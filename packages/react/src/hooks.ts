@@ -5,6 +5,9 @@ import type {
 } from '@dropinnodex/client'
 import { useDropInContext, useDropInClientOrNull, type CacheEntry } from './provider.js'
 import { useLiveTicks } from './use-live.js'
+import {
+  capRefs, runSweep, subscribeToSweeps, DEFAULT_MAX_SWEEP_REFS, type SweepResult,
+} from './object-sweep.js'
 
 /** Action-specific context passed as the second arg of `OptimisticOnError`. */
 export type OptimisticOnErrorCtx =
@@ -141,6 +144,23 @@ export function resolveRefs<TCustom = Record<string, unknown>>(
     if (obj !== undefined) out.push(obj)
   }
   return out
+}
+
+/**
+ * Every distinct ref currently on screen, in first-seen order. Activities only —
+ * `PromotedActivity` carries no `refs`, so a promoted row has nothing to resolve.
+ *
+ * `refs` is read defensively: it is non-optional on the wire, but a page served by an
+ * older feed service (or a hand-built test fixture) can omit it, and this runs on a timer
+ * where a throw is invisible.
+ */
+function shownRefs(list: readonly { refs?: string[] }[]): string[] {
+  const seen = new Set<string>()
+  for (const a of list) {
+    if (!Array.isArray(a.refs)) continue
+    for (const ref of a.refs) seen.add(ref)
+  }
+  return [...seen]
 }
 
 /**
@@ -437,8 +457,29 @@ export interface UseFeedOptions<TCustom = Record<string, unknown>> {
    * visibility-aware. Kept working; ignored when `live` is set. */
   pollInterval?: number
   /** Keep this feed fresh: cheap head check every 5s while visible, paused while
-   * hidden, full fetch only when something actually changed. */
+   * hidden, full fetch only when something actually changed. Objects — the mutable half
+   * of a feed — are re-read on their own slower cadence; see `liveObjectsInterval`. */
   live?: boolean
+  /**
+   * Milliseconds between object re-reads under `live`. Default 30000; `0` disables the
+   * object sweep while leaving activity freshness untouched.
+   *
+   * Separate from the 5s head cadence on purpose. The head check is one Redis read that
+   * usually answers "nothing new"; the object sweep is a real batch read of every ref on
+   * screen, and objects move a handful of times a day, not a handful of times a minute.
+   * Running both at 5s would bill six times the requests for the same information.
+   */
+  liveObjectsInterval?: number
+  /**
+   * Ceiling on how many refs one object sweep reads, across all its requests. Default
+   * 200; every 100 refs is one request per tick.
+   *
+   * A deeply scrolled feed can hold thousands of refs, and refreshing all of them every
+   * interval would cost more than the per-card polling this replaces. Past the ceiling
+   * the NEWEST activities are refreshed and the tail keeps its last-read values — stale
+   * rather than expensive, warned once in the console rather than silently.
+   */
+  liveObjectsMaxRefs?: number
   /** Activities before the first promoted slot in `items`. Default 3. */
   promotedPosition?: number
   /** Activities between promoted slots. Omit (or null) to place exactly once. */
@@ -620,6 +661,24 @@ export function useFeed<TCustom = Record<string, unknown>>(
   useEffect(() => {
     pathOwnerRef.current = new Map()
   }, [feedKey])
+
+  /**
+   * Fold an incoming `objects` sidecar into the one on screen, and into the shared cache
+   * so a remount renders the merged map rather than the last full page's.
+   *
+   * Merge, never replace: every caller of this is a page-1 read, and a reader who has
+   * paged deeper holds refs page 1 does not carry. `objectsRef` is advanced eagerly so a
+   * caller that also writes the cache later in the same tick (checkNew's empty-feed
+   * branch) picks up the merged map instead of the pre-merge one.
+   */
+  const mergeObjects = useCallback((incoming: Record<string, DropInObject<TCustom>> | undefined) => {
+    if (incoming === undefined || Object.keys(incoming).length === 0) return
+    const merged = { ...objectsRef.current, ...incoming }
+    objectsRef.current = merged
+    setObjects(merged)
+    const entry = cache.get(feedKey) as Entry | undefined
+    if (entry !== undefined) setCache({ ...entry, objects: merged })
+  }, [cache, feedKey])
 
   // The fetch itself, with no policy: `loadNext` and `retry` differ only in which guards
   // they apply before calling this.
@@ -851,6 +910,14 @@ export function useFeed<TCustom = Record<string, unknown>>(
       // changed) while the request was in flight — drop a result that would otherwise
       // write another feed's activities into this (now different) feed's state.
       if (feedKeyRef.current !== feedKey) return
+      // The page this call already paid for carries the `objects` sidecar, and objects
+      // are the half of a feed that actually changes. Dropping it here was the reason
+      // `live: true` delivered no object freshness at all. MERGE, not replace: this is a
+      // page-1 read, so replacing would blank cards a reader resolved off page 2+ (same
+      // rule as loadNext). Applied before the empty-feed branch below, since that one
+      // returns early. Activities still buffer rather than prepend — an object moving
+      // under a card is not the feed jumping under the reader.
+      mergeObjects(page.objects)
       const cur = activitiesRef.current
       // A previously-empty feed has nothing to "jump" — load its first activities directly.
       if (cur.length === 0) {
@@ -879,7 +946,97 @@ export function useFeed<TCustom = Record<string, unknown>>(
     } catch {
       // Swallowed — see best-effort comment above.
     }
-  }, [client, cache, feedKey, group, id, pageSize])
+  }, [client, cache, feedKey, group, id, pageSize, mergeObjects])
+
+  // ── Object freshness ──────────────────────────────────────────────────────────
+  // The feed head token moves on fan-out, and an object upsert appends no activity, so
+  // no activity-side signal can ever report that an object changed. Activities are
+  // immutable; objects are the mutable half. They therefore get their own read.
+  //
+  // A `head`-style check (refs in, `updated_at` out) was considered and dropped: the
+  // timestamp lives in the same Postgres row as `custom`, so it is the same scan and the
+  // same row count — it would buy a smaller payload at the cost of a second round trip
+  // on every sweep. One batch read of the whole ref set is cheaper and simpler.
+  const liveObjectsInterval = opts?.liveObjectsInterval ?? 30_000
+  const liveObjectsMaxRefs = opts?.liveObjectsMaxRefs ?? DEFAULT_MAX_SWEEP_REFS
+
+  // What we held for each swept ref at tick time. Read back when the result lands: a ref
+  // absent from a COVERED chunk whose local copy still matches this snapshot was deleted
+  // server-side; one that changed meanwhile was written by a concurrent page read (a
+  // loadNext or refresh landing mid-sweep) and must be left alone.
+  const sweptBeforeRef = useRef<Map<string, string | undefined>>(new Map())
+
+  // Applying a sweep is separate from performing one, because one read now serves every
+  // mounted hook on this feed (see object-sweep.ts). Whichever instance ticks first does
+  // the request; all of them land here.
+  const applySweep = useCallback((result: SweepResult<TCustom>) => {
+    const before = sweptBeforeRef.current
+    const cur = objectsRef.current
+    const out = { ...cur }
+    let changed = false
+    // Iterate the COVERED refs, not the ones we asked for: a chunk that failed tells us
+    // nothing about its refs, and treating "no answer" as "deleted" would drop live
+    // objects whenever one request of a chunked sweep timed out.
+    for (const ref of result.asked) {
+      const got = result.fresh[ref]
+      const held = cur[ref]
+      if (got !== undefined) {
+        // Newest `updated_at` wins, and equal counts as unchanged. Both halves matter:
+        // taking the response unconditionally would let a sweep that started before a
+        // refresh pin the card back to the older read when it lands after it, and
+        // re-storing an identical object would hand every consumer a new identity —
+        // a re-render of the whole list every interval for no change at all.
+        if (held === undefined || Date.parse(got.updated_at) > Date.parse(held.updated_at)) {
+          out[ref] = got
+          changed = true
+        }
+      } else if (held !== undefined && before.has(ref) && before.get(ref) === held.updated_at) {
+        // Covered by a successful chunk, absent from it, and nothing wrote it meanwhile:
+        // deleted server-side. Keeping it would render a cancelled session forever;
+        // dropping it restores the documented fallback to the activity's own `custom`.
+        // `before.has` matters for a hook that joined a sweep started for another
+        // instance's ref list — refs it never snapshotted are not its business.
+        delete out[ref]
+        changed = true
+      }
+    }
+    if (!changed) return
+    objectsRef.current = out
+    setObjects(out)
+    const entry = cache.get(feedKey) as Entry | undefined
+    if (entry !== undefined) setCache({ ...entry, objects: out })
+  }, [cache, feedKey])
+
+  useEffect(
+    () => subscribeToSweeps<TCustom>(cache, feedKey, applySweep),
+    [cache, feedKey, applySweep],
+  )
+
+  const revalidateObjects = useCallback(async () => {
+    if (client === null) return
+    // react and @dropinnodex/client version independently: a newer react paired with a
+    // client that predates getMany must degrade to activity-only freshness, not throw on
+    // a timer forever. Feature-detect rather than assume the installed client's shape.
+    const objectsApi = (client as { objects?: { getMany?: unknown } }).objects
+    if (typeof objectsApi?.getMany !== 'function') return
+    const refs = capRefs(cache, feedKey, shownRefs(activitiesRef.current), liveObjectsMaxRefs)
+    if (refs.length === 0) return
+    sweptBeforeRef.current = new Map(refs.map((r) => [r, objectsRef.current[r]?.updated_at]))
+    // Cooldown just under the interval: two hooks on the same feed mount at different
+    // moments, so their timers are offset and both would otherwise read the same data
+    // seconds apart. The one that skips still receives the other's result.
+    await runSweep<TCustom>(
+      cache, feedKey, refs, liveObjectsInterval * 0.9,
+      (chunk) => client.objects.getMany<TCustom>(chunk, { signal: readSignal() }),
+    )
+  }, [client, cache, feedKey, liveObjectsInterval, liveObjectsMaxRefs])
+
+  useLiveTicks(
+    opts?.live === true && liveObjectsInterval > 0,
+    () => { void revalidateObjects() },
+    // Guarded above, but never hand setInterval a 0 delay even on an unreachable path.
+    liveObjectsInterval > 0 ? liveObjectsInterval : 30_000,
+  )
 
   // live: signal-consumption head polling (spec 2026-07-31-live-updates). lastHeadRef is
   // the last head value ACTED ON — deliberately not compared against list contents: a
