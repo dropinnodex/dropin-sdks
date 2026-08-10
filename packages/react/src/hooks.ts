@@ -517,6 +517,10 @@ export function useFeed<TCustom = Record<string, unknown>>(
   // Timestamp of the last page-1 read from ANY driver (head-change checkNew, or the
   // revalidate tick itself), so the two never read the same page seconds apart.
   const lastPageReadAtRef = useRef(0)
+  // Newest tenant change counter seen by a head tick, and the value the last revalidation
+  // actually ran against. Equal means nothing has been mutated in between.
+  const seenChangedRef = useRef<number | undefined>(undefined)
+  const revalidatedChangedRef = useRef<number | undefined>(undefined)
   // The cache is intentionally shared/untyped (one CacheEntry — fixed to the default
   // TCustom — serves every TCustom a caller might use across the app), so both the read
   // and the write need a cast at this boundary rather than threading TCustom through the
@@ -1138,6 +1142,13 @@ export function useFeed<TCustom = Record<string, unknown>>(
    * `runSweep`.
    */
   const revalidateTick = useCallback(async () => {
+    // Nothing in this tenant has been mutated since the last revalidation, so there is no
+    // edit to reconcile and no object to re-read — skip both requests. `undefined` means
+    // the server does not report the counter (or Redis is down), and unknown must mean
+    // revalidate: a wasted read is cheap, a permanently stale feed is not.
+    const seen = seenChangedRef.current
+    if (seen !== undefined && seen === revalidatedChangedRef.current) return
+    revalidatedChangedRef.current = seen
     if (Date.now() - lastPageReadAtRef.current >= liveRevalidateInterval * 0.9) await checkNew()
     await sweepObjects(liveRevalidateInterval * 0.9)
   }, [checkNew, sweepObjects, liveRevalidateInterval])
@@ -1157,11 +1168,14 @@ export function useFeed<TCustom = Record<string, unknown>>(
   const headTick = useCallback(async () => {
     if (client === null) return
     try {
-      const { latest } = await client.feed(group, id).head({ signal: readSignal() })
+      const { latest, changed } = await client.feed(group, id).head({ signal: readSignal() })
       // Mirrors checkNew's guard: the feed this call was checking for may have been
       // switched away from while the request was in flight — drop it rather than
       // consuming a head value (or triggering checkNew) against the new feed's state.
       if (feedKeyRef.current !== feedKey) return
+      // Recorded on every head tick, consumed by the revalidate tick. `undefined` against
+      // a feed service that predates the counter, which keeps revalidation unconditional.
+      seenChangedRef.current = changed ?? undefined
       if (latest === null || latest === lastHeadRef.current) return
       lastHeadRef.current = latest // consume BEFORE the fetch — checkNew dedupes races internally
       await checkNew()

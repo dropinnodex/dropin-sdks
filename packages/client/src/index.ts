@@ -348,10 +348,22 @@ export class DropInClient {
       // up by popularity. A capped top-N, so no cursor and no `next`.
       suggestions: async (q: { limit?: number } = {}, opts: RequestOptions = {}) =>
         this.call<{ results: Suggestion[] }>('GET', `${path()}/suggestions${this.qs({ limit: q.limit })}`, undefined, opts),
-      /** Cheap change signal (Redis-only server-side). `latest` is an opaque token:
-       * compare with the last value you acted on; null means "nothing new". */
+      /**
+       * Cheap change signal, Redis-only server-side. Two independent fields:
+       *
+       * - `latest` — opaque token for NEW activities. Compare with the last value you
+       *   acted on; null means nothing new.
+       * - `changed` — tenant mutation counter, covering the changes `latest` cannot
+       *   report: an activity edited, a reaction moved, an object written. Unchanged
+       *   since your last revalidation means you can skip re-reading the page and its
+       *   objects entirely. `null` means unknown — revalidate rather than assume.
+       *
+       * It is tenant-wide, so another feed's write can make yours revalidate once. That
+       * is the price of a signal an object write can actually reach: an object does not
+       * know which feeds reference it.
+       */
       head: async (opts: RequestOptions = {}) =>
-        this.call<{ latest: string | null }>('GET', `${path()}/head`, undefined, opts),
+        this.call<{ latest: string | null; changed: number | null }>('GET', `${path()}/head`, undefined, opts),
     }
   }
 
@@ -452,6 +464,6 @@ export class DropInClient {
       this.call<void>('POST', '/v1/notifications/mark', ids?.length ? { read: ids } : { read: true }, opts),
     /** Cheap change signal for the caller's notifications. See feed().head(). */
     head: (opts: RequestOptions = {}) =>
-      this.call<{ latest: string | null }>('GET', '/v1/notifications/head', undefined, opts),
+      this.call<{ latest: string | null; changed: number | null }>('GET', '/v1/notifications/head', undefined, opts),
   }
 }

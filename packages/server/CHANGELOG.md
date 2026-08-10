@@ -1,5 +1,12 @@
 # @dropinnodex/server
 
+## 0.10.2
+
+### Patch Changes
+
+- Updated dependencies [2ed2374]
+  - @dropinnodex/client@0.8.0
+
 ## 0.10.1
 
 ### Patch Changes

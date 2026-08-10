@@ -1221,3 +1221,87 @@ describe('reconcile: row version', () => {
     } finally { vi.useRealTimers() }
   })
 })
+
+// ── Tenant change counter ───────────────────────────────────────────────────────
+// The 30s revalidation is the expensive tick: a page read plus a batch object read, both
+// hitting Postgres. `changed` lets a client skip it entirely when nothing in the tenant
+// has been mutated — which, on a quiet tenant, is almost always.
+
+describe('useFeed live: change counter gating', () => {
+  it('skips the revalidation entirely while the counter is unchanged', async () => {
+    vi.useFakeTimers()
+    try {
+      const { client, get, getMany } = liveClient({
+        head: vi.fn(async () => ({ latest: null, changed: 7 })),
+      })
+      renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+
+      // First revalidate tick has nothing to compare against, so it runs once.
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
+      expect(get).toHaveBeenCalledTimes(2)
+      expect(getMany).toHaveBeenCalledTimes(1)
+
+      // Counter still 7 across the next three ticks: no page read, no object read.
+      await act(async () => { await vi.advanceTimersByTimeAsync(90_000) })
+      expect(get).toHaveBeenCalledTimes(2)
+      expect(getMany).toHaveBeenCalledTimes(1)
+    } finally { vi.useRealTimers() }
+  })
+
+  it('revalidates again once the counter moves', async () => {
+    vi.useFakeTimers()
+    try {
+      let changed = 7
+      const { client, get, getMany } = liveClient({
+        head: vi.fn(async () => ({ latest: null, changed })),
+      })
+      renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
+      expect(getMany).toHaveBeenCalledTimes(1)
+
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
+      expect(getMany).toHaveBeenCalledTimes(1) // still 7 — skipped
+
+      changed = 8 // somebody wrote something
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
+      expect(getMany).toHaveBeenCalledTimes(2)
+      expect(get).toHaveBeenCalledTimes(3)
+    } finally { vi.useRealTimers() }
+  })
+
+  // Unknown must mean revalidate. A feed service that predates the counter, or one whose
+  // Redis is down, returns null — and treating that as "nothing changed" would freeze
+  // every open feed silently, which is strictly worse than a wasted read.
+  it('revalidates unconditionally when the server reports no counter', async () => {
+    vi.useFakeTimers()
+    try {
+      const { client, getMany } = liveClient({
+        head: vi.fn(async () => ({ latest: null, changed: null })),
+      })
+      renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(90_000) })
+      expect(getMany).toHaveBeenCalledTimes(3)
+    } finally { vi.useRealTimers() }
+  })
+
+  // A hand call is user intent, not a timer. Gating it would return stale data right
+  // after the write the caller made.
+  it('never gates the imperative revalidateObjects()', async () => {
+    vi.useFakeTimers()
+    try {
+      const { client, getMany } = liveClient({
+        head: vi.fn(async () => ({ latest: null, changed: 7 })),
+      })
+      const { result } = renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
+      const afterTick = getMany.mock.calls.length
+
+      await act(async () => { await result.current.revalidateObjects() })
+      expect(getMany.mock.calls.length).toBe(afterTick + 1)
+    } finally { vi.useRealTimers() }
+  })
+})

@@ -1,5 +1,33 @@
 # @dropinnodex/client
 
+## 0.8.0
+
+### Minor Changes
+
+- 2ed2374: The head check now reports whether anything in the tenant has been mutated, so a `live`
+  feed can skip its revalidation entirely when nothing has.
+
+  `live: true` ran two loops: a 5s head check (one Redis read) and a 30s revalidation (a
+  page read plus a batch object read, both hitting Postgres). The 30s loop is roughly ten
+  times the cost of the 5s one, and on a quiet tenant every single run of it found nothing.
+
+  `head()` now returns `{ latest, changed }`. `changed` is a per-tenant counter incremented
+  on every write the head token structurally cannot report — an activity edited, a reaction
+  moved, an object written. When it has not moved since the last revalidation, the hook
+  issues neither request.
+
+  `null` means unknown: nothing mutated yet, or Redis unavailable. Unknown revalidates. A
+  wasted read is cheap; a permanently stale feed is not — so the same applies against a feed
+  service that predates the field.
+
+  Tenant-wide rather than per feed, deliberately. An object does not know which feeds
+  reference it, so a per-feed counter would need the fan-out on write this whole design
+  avoids. The cost is a false positive: one tenant's write makes every open feed in that
+  tenant revalidate once. That degrades to the previous behaviour on a busy tenant and
+  removes nearly all of it on a quiet one.
+
+  `revalidateObjects()` is never gated — a hand call is user intent, not a timer.
+
 ## 0.7.0
 
 ### Minor Changes
