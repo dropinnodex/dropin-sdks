@@ -730,11 +730,14 @@ export function useFeed<TCustom = Record<string, unknown>>(
     let changed = false
     const merged = activitiesRef.current.map((a) => {
       const got = byId.get(a.id)
-      // `edited_at` is the server's own marker, so comparing it (rather than diffing the
-      // body) is also what keeps an in-flight optimistic `updateActivity` safe: that patch
-      // has not moved the server's `edited_at` yet, so the pre-edit body coming back here
-      // is not mistaken for newer and does not stomp the optimistic value.
-      if (got === undefined || got.edited_at === a.edited_at) return a
+      // `version` bumps on ANY write to the row — a patch, a reaction count, a soft
+      // delete — which is exactly the question being asked. `edited_at` marks patches
+      // only, so it is blind to the field that moves most and is not used here.
+      //
+      // Comparing a server-set marker rather than the body is also what keeps an
+      // in-flight optimistic `updateActivity` safe: that patch does not move `version`,
+      // so the pre-edit row coming back is not mistaken for newer.
+      if (got === undefined || got.version === a.version) return a
       changed = true
       return got
     })

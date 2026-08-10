@@ -15,7 +15,7 @@ const activity = (
   id, actor: 'user:alice', verb: 'post', object: 'w:1', target: null, foreign_id: null,
   time: '2026-07-17T10:00:00Z', custom: {}, origin_feed: 'user:alice',
   reaction_counts: {}, actor_user: null, own_reactions: [],
-  refs, edited_at: null,
+  refs, edited_at: null, version: 1,
   ...over,
 }) as Activity
 
@@ -849,15 +849,15 @@ describe('useFeed live: sweep cost and failure handling', () => {
 // read on the revalidate cadence so it happens without a new activity to trigger it.
 
 describe('checkNew: activity edits', () => {
-  const edited = (id: string, editedAt: string | null, custom: Record<string, unknown>) =>
-    activity(id, [], { edited_at: editedAt, custom })
+  const edited = (id: string, version: number, custom: Record<string, unknown>) =>
+    activity(id, [], { version, custom })
 
-  it('replaces a shown activity whose edited_at moved', async () => {
+  it('replaces a shown activity whose version moved', async () => {
     vi.useFakeTimers()
     try {
       const get = vi.fn()
-        .mockResolvedValueOnce({ results: [edited('a1', null, { title: 'Yoga' })], next: null })
-        .mockResolvedValue({ results: [edited('a1', '2026-08-09T10:05:00Z', { title: 'Yoga (moved)' })], next: null })
+        .mockResolvedValueOnce({ results: [edited('a1', 1, { title: 'Yoga' })], next: null })
+        .mockResolvedValue({ results: [edited('a1', 2, { title: 'Yoga (moved)' })], next: null })
       let latest: string | null = null
       const { client } = liveClient({ get, head: vi.fn(async () => ({ latest })) })
       const { result } = renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
@@ -876,11 +876,11 @@ describe('checkNew: activity edits', () => {
   it('keeps list order and identity of untouched rows', async () => {
     vi.useFakeTimers()
     try {
-      const first = [edited('a1', null, { n: 1 }), edited('a2', null, { n: 2 })]
+      const first = [edited('a1', 1, { n: 1 }), edited('a2', 1, { n: 2 })]
       const get = vi.fn()
         .mockResolvedValueOnce({ results: first, next: null })
         .mockResolvedValue({
-          results: [edited('a1', null, { n: 1 }), edited('a2', '2026-08-09T10:05:00Z', { n: 22 })],
+          results: [edited('a1', 1, { n: 1 }), edited('a2', 2, { n: 22 })],
           next: null,
         })
       let latest: string | null = null
@@ -897,10 +897,10 @@ describe('checkNew: activity edits', () => {
     } finally { vi.useRealTimers() }
   })
 
-  it('leaves the list alone when no edited_at moved', async () => {
+  it('leaves the list alone when no version moved', async () => {
     vi.useFakeTimers()
     try {
-      const get = vi.fn(async () => ({ results: [edited('a1', null, { n: 1 })], next: null }))
+      const get = vi.fn(async () => ({ results: [edited('a1', 1, { n: 1 })], next: null }))
       let latest: string | null = null
       const { client } = liveClient({ get, head: vi.fn(async () => ({ latest })) })
       const { result } = renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
@@ -913,15 +913,15 @@ describe('checkNew: activity edits', () => {
     } finally { vi.useRealTimers() }
   })
 
-  // An in-flight optimistic patch has not moved the server's edited_at yet, so the
+  // An in-flight optimistic patch has not moved the server's version yet, so the
   // reconcile must not treat the server's pre-edit body as newer and stomp it.
   it('does not clobber an in-flight optimistic updateActivity', async () => {
     vi.useFakeTimers()
     try {
       let release!: () => void
       const gate = new Promise<void>((r) => { release = r })
-      const get = vi.fn(async () => ({ results: [edited('a1', null, { title: 'server' })], next: null }))
-      const updateActivity = vi.fn(async () => { await gate; return edited('a1', '2026-08-09T11:00:00Z', { title: 'mine' }) })
+      const get = vi.fn(async () => ({ results: [edited('a1', 1, { title: 'server' })], next: null }))
+      const updateActivity = vi.fn(async () => { await gate; return edited('a1', 2, { title: 'mine' }) })
       let latest: string | null = null
       const { client } = liveClient({ get, head: vi.fn(async () => ({ latest })) })
       ;(client.feed as ReturnType<typeof vi.fn>).mockImplementation(() => ({
@@ -948,9 +948,9 @@ describe('useFeed live: revalidate cadence', () => {
     vi.useFakeTimers()
     try {
       const get = vi.fn()
-        .mockResolvedValueOnce({ results: [activity('a1', [], { edited_at: null, custom: { n: 1 } })], next: null })
+        .mockResolvedValueOnce({ results: [activity('a1', [], { version: 1, custom: { n: 1 } })], next: null })
         .mockResolvedValue({
-          results: [activity('a1', [], { edited_at: '2026-08-09T10:05:00Z', custom: { n: 2 } })], next: null,
+          results: [activity('a1', [], { version: 2, custom: { n: 2 } })], next: null,
         })
       // head never moves — this is the gap: an edit is invisible to the 5s signal.
       const { client } = liveClient({ get, head: vi.fn(async () => ({ latest: null })) })
@@ -1164,6 +1164,60 @@ describe('checkNew: the two documented limits of edit reconciliation', () => {
       await act(async () => { await vi.advanceTimersByTimeAsync(0) })
       await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
       expect(result.current.activities.map((a) => a.id)).toEqual(['a1', 'a2'])
+    } finally { vi.useRealTimers() }
+  })
+})
+
+// ── Row version ─────────────────────────────────────────────────────────────────
+// `version` is the only staleness signal. `edited_at` is an EDIT marker: reaction counts
+// — the field that moves most — never touch it, so a page read returned fresh counts and
+// the reconcile threw them away as unchanged. `edited_at` stays on the wire as the
+// human-facing "this was edited" flag; it is not what decides a re-render.
+
+describe('reconcile: row version', () => {
+  const withVersion = (id: string, version: number, custom: Record<string, unknown>) =>
+    activity(id, [], { edited_at: null, version, custom })
+
+  it('reconciles a reaction count — version moved, edited_at did not', async () => {
+    vi.useFakeTimers()
+    try {
+      const get = vi.fn()
+        .mockResolvedValueOnce({
+          results: [activity('a1', [], { edited_at: null, version: 1, reaction_counts: {} })],
+          next: null,
+        })
+        .mockResolvedValue({
+          results: [activity('a1', [], { edited_at: null, version: 2, reaction_counts: { like: 1 } })],
+          next: null,
+        })
+      let latest: string | null = null
+      const { client } = liveClient({ get, head: vi.fn(async () => ({ latest })) })
+      const { result } = renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(result.current.activities[0]!.reaction_counts).toEqual({})
+
+      latest = 'x'
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      expect(result.current.activities[0]!.reaction_counts).toEqual({ like: 1 })
+    } finally { vi.useRealTimers() }
+  })
+
+  it('leaves the row alone when the version is unchanged, whatever the body says', async () => {
+    vi.useFakeTimers()
+    try {
+      const get = vi.fn()
+        .mockResolvedValueOnce({ results: [withVersion('a1', 7, { t: 'mine' })], next: null })
+        // Same version, different body — a response that started before a local write.
+        .mockResolvedValue({ results: [withVersion('a1', 7, { t: 'stale server copy' })], next: null })
+      let latest: string | null = null
+      const { client } = liveClient({ get, head: vi.fn(async () => ({ latest })) })
+      const { result } = renderHook(() => useFeed('user', 'alice', { live: true }), { wrapper: wrapper(client) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      const before = result.current.activities
+
+      latest = 'x'
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      expect(result.current.activities).toBe(before)
     } finally { vi.useRealTimers() }
   })
 })

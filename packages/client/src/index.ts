@@ -19,6 +19,13 @@ export interface Activity<TCustom = Record<string, unknown>> {
   refs: string[]
   /** Null until the activity has been patched. */
   edited_at: string | null
+  /**
+   * Row version. Starts at 1 and increments on ANY change to this activity — a patch, a
+   * reaction count moving, a soft delete. This is the field to compare when deciding
+   * whether a copy you hold is stale; `edited_at` marks patches only, so it misses the
+   * field that changes most.
+   */
+  version: number
 }
 
 /** Tenant-owned mutable data an activity points at, resolved into `FeedPage.objects`. */

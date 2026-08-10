@@ -1,5 +1,33 @@
 # @dropinnodex/react
 
+## 0.11.0
+
+### Minor Changes
+
+- 02c378e: Activities carry a `version`, and it is what decides whether a rendered row is stale.
+
+  `edited_at` was doing that job and is structurally unable to. It marks PATCHes only, so
+  the field that changes most — `reaction_counts` — never moved it. A feed with `live: true`
+  therefore fetched fresh reaction counts on every page read and discarded them as
+  unchanged: the same bug shape as the objects sidecar being binned, one field over.
+
+  `version` starts at 1 and increments on any real change to the activity row — a patch, a
+  reaction count, a soft delete. It is bumped by a database trigger rather than by each
+  writer: there are four UPDATE sites today, and a missed one fails silently, with the write
+  landing, the version staying put, and every open feed showing stale data with no error
+  anywhere. A trigger cannot be forgotten by a writer that does not exist yet.
+
+  `edited_at` stays on the wire. It is still the right field for an "edited" badge — it just
+  is not a staleness signal.
+
+  Requires a feed service carrying migration `0009_activity_version.sql`. There is no
+  fallback to the old `edited_at` comparison: deploy the backend first, as usual.
+
+### Patch Changes
+
+- Updated dependencies [02c378e]
+  - @dropinnodex/client@0.7.0
+
 ## 0.10.0
 
 ### Minor Changes
