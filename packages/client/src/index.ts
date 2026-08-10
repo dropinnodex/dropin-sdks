@@ -356,7 +356,8 @@ export class DropInClient {
        * - `changed` — tenant mutation counter, covering the changes `latest` cannot
        *   report: an activity edited, a reaction moved, an object written. Unchanged
        *   since your last revalidation means you can skip re-reading the page and its
-       *   objects entirely. `null` means unknown — revalidate rather than assume.
+       *   objects entirely. 0 means nothing has ever been mutated here; `null` means
+       *   unknown (a corrupted counter) — revalidate rather than assume.
        *
        * It is tenant-wide, so another feed's write can make yours revalidate once. That
        * is the price of a signal an object write can actually reach: an object does not

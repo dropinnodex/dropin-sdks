@@ -1143,9 +1143,10 @@ export function useFeed<TCustom = Record<string, unknown>>(
    */
   const revalidateTick = useCallback(async () => {
     // Nothing in this tenant has been mutated since the last revalidation, so there is no
-    // edit to reconcile and no object to re-read — skip both requests. `undefined` means
-    // the server does not report the counter (or Redis is down), and unknown must mean
-    // revalidate: a wasted read is cheap, a permanently stale feed is not.
+    // edit to reconcile and no object to re-read — skip both requests. A fresh tenant
+    // reports 0, which is a real value and gates like any other. `undefined` means the
+    // server does not report the counter at all, and unknown must mean revalidate: a
+    // wasted read is cheap, a permanently stale feed is not.
     const seen = seenChangedRef.current
     if (seen !== undefined && seen === revalidatedChangedRef.current) return
     revalidatedChangedRef.current = seen

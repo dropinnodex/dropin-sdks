@@ -1,5 +1,23 @@
 # @dropinnodex/client
 
+## 0.8.1
+
+### Patch Changes
+
+- ffcb951: A tenant with no writes yet now gets the revalidation skip too.
+
+  `changed` was `null` until the tenant's first write, and the client treats `null` as
+  unknown, so a brand-new or idle tenant revalidated on every 30s tick — denying the
+  optimisation to exactly the tenants it helps most. A missing counter now reads as `0`,
+  which is a definite "nothing has been mutated" and gates like any other value.
+
+  `null` is now reserved for a counter that exists but does not parse. A Redis outage was
+  never this case: the read rejects, the head route fails, and the client's head tick
+  swallows it and retries — it never arrives as a value. The previous docs said otherwise
+  and were wrong.
+
+  Server-side only; no client code changed.
+
 ## 0.8.0
 
 ### Minor Changes
