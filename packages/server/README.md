@@ -4,7 +4,11 @@ Server-side SDK for [dropin-activity](https://github.com/) — a GetStream-shape
 feed as a service. **Node only** (imports `node:crypto`; never ship it to a browser).
 
 Your backend uses this to mint short-lived user tokens **offline** (zero network calls to
-the feed service), upsert users, and manage webhook destinations.
+the feed service), post activities, upsert users, and manage webhook destinations.
+
+Posting from the backend is a first-class path, not a fallback: activities emitted from a
+database trigger or a job queue never touch a browser, and a server token can set `actor`
+and post historical `time` values a user token cannot.
 
 ```bash
 npm i @dropinnodex/server
@@ -24,9 +28,19 @@ const dropin = new DropInServer({
 // Mint a token for your frontend (HS256, signed with your apiSecret). Zero calls to us.
 const token = await dropin.createUserToken('user-123', { expiresIn: '1h' })
 
-// Users
-await dropin.upsertUser({ id: 'user-123', custom: { name: 'Ada' } })
+// Users — do this BEFORE posting as an actor, or their cards render with no name.
+await dropin.upsertUser({ id: 'user-123', custom: { name: 'Ada', image: 'https://…' } })
 await dropin.revokeUserTokens('user-123')   // log this user out everywhere
+
+// Activities, straight from your backend
+const activity = await dropin.feed('user', 'user-123').addActivity({
+  verb: 'workout',
+  object: 'workout:1234',
+  foreign_id: 'workout:1234',              // with `time`, makes a retry idempotent
+  time: new Date().toISOString(),
+  custom: { sport: 'run', durationMin: 45 },
+})
+activity.warnings // ['actor_user_unresolved'] if that actor was never upserted
 
 // Outbound webhooks (server-token only)
 await dropin.webhooks.create({ url: 'https://acme.com/dropin-hooks' })
@@ -81,6 +95,31 @@ await dropin.activities.patch(activityId, { refs: ['session:1234'] })
 `custom` wholesale, so omitting it would wipe the object; the server rejects the
 call instead. Every `set`/`unset` path (objects and activities) must start with
 `custom.`; `unset` is applied after `set`.
+
+## Errors
+
+Every failed request rejects with a `DropInApiError` — the same class
+`@dropinnodex/client` throws, so one `catch` covers both SDKs:
+
+```ts
+import { DropInServer, DropInApiError } from '@dropinnodex/server'
+
+try {
+  await dropin.feed('user', 'user-123').addActivity({ verb: 'post', object: 'w:1' })
+} catch (err) {
+  if (!(err instanceof DropInApiError)) throw err   // network failure or abort
+
+  err.code               // 'RATE_LIMITED' | 'VALIDATION_FAILED' | … — branch on this
+  err.status             // 429
+  err.requestId          // log it; it identifies the request in support
+  err.retryAfterSeconds  // set on a 429, undefined otherwise
+  err.fields             // [{ path, message }] on a VALIDATION_FAILED with detail
+  err.url                // which request failed — worth logging from a multi-route job
+}
+```
+
+`RATE_LIMITED` and `INTERNAL` are the retryable codes; everything else will fail
+identically on a replay. Full table: [Errors](https://docs.getnodex.cloud/concepts/errors/).
 
 ## Cancellation
 

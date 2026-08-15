@@ -118,7 +118,11 @@ This is the one intentional divergence from GetStream's activity shape. Reach fo
 `activity.custom.yourField` rather than `activity.yourField`.
 
 The token is cached until a 401, then refetched once and the request replays — never
-per-request. Errors throw `DropInApiError` with `{ code, message, status, requestId }`.
+per-request. Errors throw `DropInApiError` with
+`{ code, message, status, requestId, retryAfterSeconds?, fields?, url? }` — branch on `code`,
+never on `message`. `retryAfterSeconds` is set on a `RATE_LIMITED` (429) and `fields`
+carries per-field detail on a `VALIDATION_FAILED`. Full table:
+[Errors](https://docs.getnodex.cloud/concepts/errors/).
 
 ### Follow counts
 

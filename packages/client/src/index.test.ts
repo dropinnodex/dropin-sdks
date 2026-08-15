@@ -237,6 +237,85 @@ describe('surface', () => {
     expect(err).toMatchObject({ code: 'INTERNAL', status: 500 })
   })
 
+  it('surfaces Retry-After as retryAfterSeconds on a 429', async () => {
+    fetchMock.mockResolvedValue(new Response(
+      JSON.stringify({ error: { code: 'RATE_LIMITED', message: 'Slow down', requestId: 'req_1' } }),
+      { status: 429, headers: { 'content-type': 'application/json', 'retry-after': '42' } },
+    ))
+    const err = await client(async () => 'tok').users.me().catch((e: unknown) => e)
+    expect(err).toMatchObject({ code: 'RATE_LIMITED', retryAfterSeconds: 42 })
+  })
+
+  it('leaves retryAfterSeconds undefined when there is no Retry-After header', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(500, { error: { code: 'INTERNAL', message: 'boom', requestId: 'r' } }))
+    const err = await client(async () => 'tok').users.me().catch((e: unknown) => e)
+    expect((err as DropInApiError).retryAfterSeconds).toBeUndefined()
+  })
+
+  it('ignores an HTTP-date Retry-After rather than guessing a delay', async () => {
+    fetchMock.mockResolvedValue(new Response('nope', {
+      status: 429, headers: { 'retry-after': 'Wed, 21 Oct 2026 07:28:00 GMT' },
+    }))
+    const err = await client(async () => 'tok').users.me().catch((e: unknown) => e)
+    expect((err as DropInApiError).retryAfterSeconds).toBeUndefined()
+  })
+
+  it('keeps the body in the message when the error body is not the envelope', async () => {
+    // statusText is set ON PURPOSE: over HTTP/1.1 a real proxy 502 always carries a reason
+    // phrase, and with statusText winning, the body — the only clue about which hop failed
+    // — was dropped. A Response constructed without statusText cannot catch that.
+    fetchMock.mockResolvedValue(new Response('<html>502 from the proxy</html>', {
+      status: 502, statusText: 'Bad Gateway',
+    }))
+    const err = await client(async () => 'tok').users.me().catch((e: unknown) => e)
+    expect((err as Error).message).toContain('502 from the proxy')
+  })
+
+  it('falls back to the status line when the error body is empty', async () => {
+    fetchMock.mockResolvedValue(new Response('', { status: 503, statusText: 'Service Unavailable' }))
+    const err = await client(async () => 'tok').users.me().catch((e: unknown) => e)
+    expect((err as Error).message).toBe('Service Unavailable')
+  })
+
+  it('ignores an empty Retry-After rather than reporting "retry now"', async () => {
+    fetchMock.mockResolvedValue(new Response('x', { status: 429, headers: { 'retry-after': '  ' } }))
+    const err = await client(async () => 'tok').users.me().catch((e: unknown) => e)
+    expect((err as DropInApiError).retryAfterSeconds).toBeUndefined()
+  })
+
+  it('does not make every DropInApiError an instance of a consumer subclass', async () => {
+    // Statics are inherited: without the base-class guard, `instanceof MySubclass` would
+    // be true for any branded error, so a consumer branching on their own subclass would
+    // take the wrong branch for every API error.
+    class Narrower extends DropInApiError {}
+    expect(new DropInApiError('NOT_FOUND', 'x', 404, 'r')).not.toBeInstanceOf(Narrower)
+    expect(new Narrower('NOT_FOUND', 'x', 404, 'r')).toBeInstanceOf(Narrower)
+    expect(new Narrower('NOT_FOUND', 'x', 404, 'r')).toBeInstanceOf(DropInApiError)
+  })
+
+  it('surfaces per-field validation detail the API already sends', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(400, {
+      error: {
+        code: 'VALIDATION_FAILED', message: 'Validation failed', requestId: 'req_2',
+        fields: [{ path: 'set.note', message: 'every patch path must start with "custom." — got "note"' }],
+      },
+    }))
+    const err = await client(async () => 'tok').users.me().catch((e: unknown) => e)
+    expect((err as DropInApiError).fields).toEqual([
+      { path: 'set.note', message: 'every patch path must start with "custom." — got "note"' },
+    ])
+  })
+
+  it('instanceof holds for an error built by a SECOND copy of this module', async () => {
+    // Simulates the ESM+CJS dual-load an app hits when it imports this package while
+    // @dropinnodex/server is required as CJS: a structurally identical error from a
+    // different class object must still satisfy `instanceof DropInApiError`.
+    vi.resetModules()
+    const other = await import('./index.js') as { DropInApiError: typeof DropInApiError }
+    expect(other.DropInApiError).not.toBe(DropInApiError)
+    expect(new other.DropInApiError('NOT_FOUND', 'x', 404, 'r')).toBeInstanceOf(DropInApiError)
+  })
+
   it('falls back to INTERNAL on a JSON error body with no error envelope', async () => {
     fetchMock.mockResolvedValue(jsonResponse(500, { oops: true }))
     const err = await client(async () => 'tok').users.me().catch((e: unknown) => e)

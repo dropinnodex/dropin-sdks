@@ -1,19 +1,28 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import * as jose from 'jose'
-import { DropInServer, DEFAULT_API_URL } from './index.js'
+import { DropInApiError as ClientApiError } from '@dropinnodex/client'
+import { DropInServer, DEFAULT_API_URL, DropInApiError } from './index.js'
 
 const dropin = new DropInServer({
   tenantId: 'acme', apiKey: 'dk_test', apiSecret: 'ds_test_secret', url: 'http://localhost:3000',
 })
 
 interface FetchCallOpts { method: string; headers: Record<string, string>; body?: string }
-function mockFetchOnce(res: { ok?: boolean; status?: number; json?: unknown; text?: string }) {
+function mockFetchOnce(res: {
+  ok?: boolean; status?: number; statusText?: string; json?: unknown; text?: string
+  headers?: Record<string, string>
+}) {
   // text defaults to the SERIALISED json, because that is what a real Response does —
   // body text and .json() are the same bytes. Defaulting it to '' let the SDK's
   // empty-body handling look correct in tests while failing against a real server.
+  const headers = res.headers ?? {}
   const fn = vi.fn().mockResolvedValue({
     ok: res.ok ?? true,
     status: res.status ?? 200,
+    statusText: res.statusText ?? '',
+    // The error path reads Retry-After, so the fake needs a Headers-shaped getter —
+    // lowercased lookup, null when absent, exactly like the real one.
+    headers: { get: (k: string) => headers[k.toLowerCase()] ?? null },
     json: async () => res.json,
     text: async () => res.text ?? (res.json !== undefined ? JSON.stringify(res.json) : ''),
   })
@@ -159,9 +168,37 @@ describe('HTTP helpers', () => {
     expect(res).toEqual({ follower_count: 3, following_count: 7 })
   })
 
-  it('throws with the status and body on a non-2xx response', async () => {
-    mockFetchOnce({ ok: false, status: 403, text: 'forbidden' })
-    await expect(dropin.upsertUser({ id: 'x' })).rejects.toThrow(/403 forbidden/)
+  it('throws a typed DropInApiError, not a bare Error, on a non-2xx response', async () => {
+    mockFetchOnce({
+      ok: false, status: 403,
+      json: { error: { code: 'FORBIDDEN', message: 'not your feed', requestId: 'req_7' } },
+    })
+    const err = await dropin.upsertUser({ id: 'x' }).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(DropInApiError)
+    // The point of the whole change: a backend branches on this, not on a message regex.
+    expect(err).toMatchObject({ code: 'FORBIDDEN', status: 403, requestId: 'req_7' })
+    expect((err as Error).message).toBe('not your feed')
+  })
+
+  it('surfaces Retry-After on a 429 so a retry can sleep the right amount', async () => {
+    mockFetchOnce({
+      ok: false, status: 429, headers: { 'retry-after': '30' },
+      json: { error: { code: 'RATE_LIMITED', message: 'Slow down', requestId: 'req_8' } },
+    })
+    const err = await dropin.upsertUser({ id: 'x' }).catch((e: unknown) => e)
+    expect(err).toMatchObject({ code: 'RATE_LIMITED', retryAfterSeconds: 30 })
+  })
+
+  it('falls back to INTERNAL and keeps the body when the error body is not the envelope', async () => {
+    mockFetchOnce({ ok: false, status: 502, text: 'proxy exploded' })
+    const err = await dropin.upsertUser({ id: 'x' }).catch((e: unknown) => e)
+    expect(err).toMatchObject({ code: 'INTERNAL', status: 502 })
+    expect((err as Error).message).toContain('proxy exploded')
+  })
+
+  it('throws the SAME class @dropinnodex/client throws', async () => {
+    // A backend that also runs the client SDK (SSR) must be able to write one catch.
+    expect(DropInApiError).toBe(ClientApiError)
   })
 
   it('treats ANY empty success body as undefined, not just a 204', async () => {
@@ -404,6 +441,31 @@ describe('DropInServer reads — parity with the client SDK', () => {
     const u = new URL(url)
     expect(u.pathname).toBe('/v1/feeds/timeline/alice/suggestions')
     expect(u.searchParams.get('limit')).toBe('5')
+  })
+
+  it('feed().head GETs the head path and returns the parsed token', async () => {
+    const fn = mockFetchOnce({ status: 200, json: { latest: 'a-1', changed: 7 } })
+    const res = await dropin.feed('timeline', 'alice').head()
+    const [url, opts] = lastCall(fn)
+    expect(opts.method).toBe('GET')
+    expect(new URL(url).pathname).toBe('/v1/feeds/timeline/alice/head')
+    expect(res).toEqual({ latest: 'a-1', changed: 7 })
+  })
+
+  it('feed().head works without any params and sends no body or query', async () => {
+    const fn = mockFetchOnce({ status: 200, json: { latest: null, changed: 0 } })
+    await dropin.feed('user', 'alice').head()
+    const [url, opts] = lastCall(fn)
+    expect(new URL(url).pathname).toBe('/v1/feeds/user/alice/head')
+    expect(new URL(url).search).toBe('')
+    expect(opts.headers['content-type']).toBeUndefined()
+  })
+
+  it('feed().head preserves a null "changed" — a corrupted counter must reach the caller', async () => {
+    const fn = mockFetchOnce({ status: 200, json: { latest: null, changed: null } })
+    const res = await dropin.feed('user', 'alice').head()
+    expect(res).toEqual({ latest: null, changed: null })
+    expect(fn).toHaveBeenCalledOnce()
   })
 
   it('feed().removeActivity DELETEs the activity route, not a feed-scoped one', async () => {
@@ -765,6 +827,7 @@ describe('dot-segment path guard', () => {
     await expect(dropin.feed('.', 'alice').followers()).rejects.toThrow(/invalid path segment/)
     await expect(dropin.feed('.', 'alice').following()).rejects.toThrow(/invalid path segment/)
     await expect(dropin.feed('.', 'alice').suggestions()).rejects.toThrow(/invalid path segment/)
+    await expect(dropin.feed('.', 'alice').head()).rejects.toThrow(/invalid path segment/)
     expect(fn).not.toHaveBeenCalled()
   })
 

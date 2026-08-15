@@ -2,20 +2,30 @@
 // loudly rather than silently shipping your api_secret to a browser.
 import { timingSafeEqual } from 'node:crypto'
 import * as jose from 'jose'
-// Type-only: @dropinnodex/client is zero-dep and isomorphic, so importing its types here does
-// not pull anything into the runtime bundle (erased at compile time) and does not violate
-// the dependency boundary — which forbids @dropinnodex/client and @dropinnodex/react depending on
-// @dropinnodex/server, not the reverse. This is what makes `feed().get()` return a typed
+// @dropinnodex/client is zero-dep and isomorphic, and depending on it does not violate the
+// dependency boundary — which forbids @dropinnodex/client and @dropinnodex/react depending on
+// @dropinnodex/server, not the reverse. The types are what make `feed().get()` return a typed
 // `Page<Activity<TCustom>>` instead of `unknown`, so SSR `initialData` flows typed end to end.
+// `DropInApiError` and `apiErrorFromResponse` are VALUE imports — this package throws the
+// exact error class the browser SDK throws, built by the exact same parse, so a backend can
+// branch on `err.code` instead of regexing a message. tsup leaves the import external (only
+// `jose` is in noExternal), so both packages resolve to one class at runtime; the brand on
+// DropInApiError covers the ESM+CJS dual-load case where they cannot.
+import { DropInApiError, apiErrorFromResponse } from '@dropinnodex/client'
 import type {
-  Activity, DropInObject, FeedPage, Follow, FollowStats, Notification, NotificationPage, Page, PatchBody,
-  PromotedActivity, Reaction, RequestOptions, Suggestion,
+  Activity, DropInObject, ErrorCode, FeedPage, Follow, FollowStats, Notification, NotificationPage,
+  Page, PatchBody, PromotedActivity, Reaction, RequestOptions, Suggestion,
 } from '@dropinnodex/client'
 
+// Re-exported so a backend can NAME what this SDK hands it — `addActivity` returns
+// `Activity`, `feed().get()` returns `Page<Activity>` — without installing
+// @dropinnodex/client itself, which would be an undeclared dependency that only resolves
+// through hoisting.
 export type {
-  RequestOptions, Follow, Notification, NotificationPage, PromotedActivity, Reaction, Suggestion,
-  DropInObject, PatchBody,
+  Activity, DropInObject, ErrorCode, FeedPage, Follow, FollowStats, Notification, NotificationPage,
+  Page, PatchBody, PromotedActivity, Reaction, RequestOptions, Suggestion,
 }
+export { DropInApiError }
 
 /**
  * A webhook destination. The delivery infrastructure owns storage and the full response
@@ -219,10 +229,11 @@ export class DropInServer {
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
       signal: effectiveSignal,
     })
-    if (!res.ok) {
-      const text = await res.text()
-      throw new Error(`dropin ${method} ${path} failed: ${res.status} ${text}`)
-    }
+    // A typed error, not a bare Error with the body stringified into .message: a backend
+    // has to branch on RATE_LIMITED (sleep `retryAfterSeconds`, retry) versus
+    // VALIDATION_FAILED (drop, this will never succeed), and regexing a message string is
+    // not a decision procedure. Same class, same parse as @dropinnodex/client.
+    if (!res.ok) throw await apiErrorFromResponse(res)
     // ANY empty success body → undefined, not just a 204: `POST …/follows` answers 201
     // with no content (docs/api/v1.yaml), and res.json() of an empty body throws
     // "Unexpected end of JSON input". Read the text once, parse only if there is any.
@@ -533,6 +544,26 @@ export class DropInServer {
       suggestions: async (q: { limit?: number } = {}, opts: RequestOptions = {}) =>
         this.call<{ results: Suggestion[] }>(
           'GET', `${path()}/suggestions${qs({ limit: q.limit })}`, undefined, opts,
+        ),
+      /**
+       * Cheap change signal for a backend poller: redis-only, no tenant-DB read. The same
+       * shape as `@dropinnodex/client`'s `feed().head()` — two independent fields:
+       *
+       * - `latest` — opaque token for NEW activities. Compare with the last value you
+       *   acted on; null means nothing new.
+       * - `changed` — tenant mutation counter, covering the changes `latest` cannot
+       *   report: an activity edited, a reaction moved, an object written. Unchanged
+       *   since your last revalidation means you can skip re-reading the page and its
+       *   objects entirely. 0 means nothing has ever been mutated here; `null` means
+       *   unknown (a corrupted counter) — revalidate rather than assume.
+       *
+       * Use this from your server when a long-running watcher needs to know whether a
+       * feed moved without paying for a full page read on every poll — a bot pulling
+       * posts for a downstream system, a webhook-style revalidation sweep.
+       */
+      head: async (opts: RequestOptions = {}) =>
+        this.call<{ latest: string | null; changed: number | null }>(
+          'GET', `${path()}/head`, undefined, opts,
         ),
       /** Soft-delete an activity. A server token may remove an activity from ANY feed —
        *  the origin-feed authority check applies to user tokens only — which is what makes

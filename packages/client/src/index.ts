@@ -26,6 +26,14 @@ export interface Activity<TCustom = Record<string, unknown>> {
    * field that changes most.
    */
   version: number
+  /**
+   * Non-fatal problems the API noticed about the activity you just WROTE. Present only
+   * on the response to a create — a feed read never carries it. Today the only value is
+   * `"actor_user_unresolved"`: the write succeeded, but `actor` names a `user:` id that
+   * has never been through `upsertUser`, so `actor_user` is null and every card renders
+   * with no name and no avatar until that user is upserted. Upsert the user, then re-read.
+   */
+  warnings?: string[]
 }
 
 /** Tenant-owned mutable data an activity points at, resolved into `FeedPage.objects`. */
@@ -44,7 +52,8 @@ export interface PatchBody {
   set?: Record<string, unknown>
   unset?: string[]
   /**
-   * `feed(group, id).updateActivity()` only — ignored by `objects.patch()`, since
+   * Activity patches only — `feed(group, id).updateActivity()` in this package,
+   * `activities.patch()` in `@dropinnodex/server`. Ignored by `objects.patch()`, since
    * objects have no `refs` of their own. Replaces the activity's `refs` array
    * wholesale (not merged): each entry is `type:id`, max 4, no duplicates. `[]`
    * clears every ref. This is how an activity posted before objects existed adopts
@@ -145,16 +154,107 @@ export interface NotificationPage {
   next: string | null
 }
 
+/**
+ * Registry-wide brand. `instanceof` normally compares constructor identity, which fails
+ * the moment two copies of this package are loaded — an app that `import`s the ESM build
+ * while `@dropinnodex/server` is `require`d as CJS holds two distinct `DropInApiError`
+ * classes, and `err instanceof DropInApiError` would be false for a real API error. The
+ * brand plus the `Symbol.hasInstance` below make the check structural, so it stays true
+ * across every copy. `Symbol.for` (not `Symbol`) is what makes the key itself shared.
+ */
+const API_ERROR_BRAND: unique symbol = Symbol.for('@dropinnodex/client:DropInApiError')
+
+/** One rejected field of a `VALIDATION_FAILED` response. */
+export interface ApiFieldError {
+  /** The rejected field, e.g. `set.note`. */
+  path: string
+  message: string
+}
+
 export class DropInApiError extends Error {
   constructor(
     readonly code: ErrorCode,
     message: string,
     readonly status: number,
     readonly requestId: string,
+    /**
+     * Seconds to wait before retrying, from the response's `Retry-After` header. Set on
+     * `RATE_LIMITED` (429) and absent otherwise. Sleep this long rather than retrying in
+     * a tight loop — a tight loop is itself what the limit is defending against.
+     */
+    readonly retryAfterSeconds?: number,
+    /**
+     * Per-field detail on a `VALIDATION_FAILED`, when the API sent any: `path` is the
+     * field it rejected, `message` says why. Absent on every other code.
+     */
+    readonly fields?: ApiFieldError[],
+    /**
+     * The request URL that failed, when the runtime gave us one (`Response.url`). The
+     * message deliberately carries only what the API said, so this is what tells a
+     * backend log WHICH call failed — an error surfacing from a job that touches six
+     * routes is otherwise just "Not found".
+     */
+    readonly url?: string,
   ) {
     super(message)
     this.name = 'DropInApiError'
+    // Non-enumerable, and not a declared field: the brand must not appear in the emitted
+    // .d.ts (it would reference a non-exported symbol) or in JSON.stringify output.
+    Object.defineProperty(this, API_ERROR_BRAND, { value: true })
   }
+
+  static [Symbol.hasInstance](this: unknown, value: unknown): boolean {
+    // Statics are inherited, so a consumer's `class MyError extends DropInApiError {}`
+    // would otherwise accept EVERY DropInApiError as a MyError. Only the base class gets
+    // the structural check; a subclass falls back to ordinary prototype matching.
+    if (this !== DropInApiError) return Function.prototype[Symbol.hasInstance].call(this, value)
+    return typeof value === 'object' && value !== null && API_ERROR_BRAND in value
+  }
+}
+
+/**
+ * Turn a failed `Response` from the dropin API into a `DropInApiError`. Exported so
+ * `@dropinnodex/server` — and anyone proxying these routes — produces the exact same
+ * error object from the exact same body, rather than a second, drifting copy of this
+ * parse. Consumes the body, so pass a `Response` you have not read yet.
+ */
+export async function apiErrorFromResponse(res: Response): Promise<DropInApiError> {
+  let code: ErrorCode = 'INTERNAL'
+  let message = ''
+  let requestId = ''
+  let fields: ApiFieldError[] | undefined
+  // Read as text first: an error body is not guaranteed to be JSON (a proxy 502, an
+  // HTML error page), and res.json() would throw away the one clue we have about what
+  // answered instead.
+  const text = await res.text().catch(() => '')
+  try {
+    const parsed = JSON.parse(text) as {
+      error?: { code: ErrorCode; message: string; requestId: string; fields?: ApiFieldError[] }
+    }
+    if (parsed.error) ({ code, message, requestId, fields } = parsed.error)
+  } catch {
+    // Non-JSON error body — keep the defaults and fall through to the text below.
+  }
+  // Envelope message, else a bounded slice of whatever DID answer, else the status line.
+  // Body before statusText, not after: over HTTP/1.1 a proxy 502 carries a reason phrase
+  // ("Bad Gateway") that says nothing the status code did not, while its body is the only
+  // clue about which hop failed. (Over HTTP/2 there is no reason phrase at all.)
+  if (!message) message = text.slice(0, 200) || res.statusText
+  return new DropInApiError(
+    code, message, res.status, requestId, retryAfterSeconds(res), fields, res.url || undefined,
+  )
+}
+
+/**
+ * `Retry-After` in delta-seconds. The HTTP-date form is legal but the dropin API never
+ * sends it, so an unparseable value is reported as absent rather than guessed at.
+ */
+function retryAfterSeconds(res: Response): number | undefined {
+  const raw = res.headers.get('retry-after')?.trim()
+  // `Number('')` is 0, which would report a header that says nothing as "retry now".
+  if (raw === undefined || raw === '') return undefined
+  const seconds = Number(raw)
+  return Number.isFinite(seconds) && seconds >= 0 ? seconds : undefined
 }
 
 /** The hosted API. Overridden via `url` for staging, a proxy, or local development. */
@@ -268,17 +368,8 @@ export class DropInClient {
     })
   }
 
-  private async toError(res: Response): Promise<DropInApiError> {
-    let code: ErrorCode = 'INTERNAL'
-    let message = res.statusText
-    let requestId = ''
-    try {
-      const parsed = (await res.json()) as { error?: { code: ErrorCode; message: string; requestId: string } }
-      if (parsed.error) ({ code, message, requestId } = parsed.error)
-    } catch {
-      // Non-JSON error body — keep the defaults.
-    }
-    return new DropInApiError(code, message, res.status, requestId)
+  private toError(res: Response): Promise<DropInApiError> {
+    return apiErrorFromResponse(res)
   }
 
   private qs(params: Record<string, string | number | undefined>): string {

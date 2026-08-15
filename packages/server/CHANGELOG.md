@@ -1,5 +1,34 @@
 # @dropinnodex/server
 
+## 0.11.0
+
+### Minor Changes
+
+- 2a5745f: Typed errors on both SDKs, and the types the server SDK hands back are now nameable from
+  the server SDK.
+
+  - `@dropinnodex/server` throws `DropInApiError` instead of a bare `Error` with the JSON
+    body stringified into `.message`. Branch on `err.code`; no more message regexes. It is
+    the same class `@dropinnodex/client` throws, built by the same parse, so one `catch`
+    covers both.
+  - `DropInApiError` gained `retryAfterSeconds` (from the `Retry-After` header the API has
+    always sent on a 429), `fields` (the per-field detail a `VALIDATION_FAILED` has always
+    carried) and `url` (which request failed). The first two were being discarded.
+  - `instanceof DropInApiError` now holds across two loaded copies of the package — the
+    ESM+CJS dual-load case where constructor identity fails.
+  - `@dropinnodex/server` re-exports `Activity`, `FeedPage`, `Page`, `FollowStats`,
+    `ErrorCode` and `DropInApiError`. `addActivity` returns `Activity`; naming that type
+    previously required installing `@dropinnodex/client`, an undeclared dependency that
+    only resolved through hoisting.
+  - The create-activity response carries `warnings: ["actor_user_unresolved"]` when the
+    actor has no user record, so a write that renders a blank card is no longer
+    byte-identical to a correct one.
+
+### Patch Changes
+
+- Updated dependencies [2a5745f]
+  - @dropinnodex/client@0.9.0
+
 ## 0.10.2
 
 ### Patch Changes
