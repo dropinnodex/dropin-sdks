@@ -132,6 +132,12 @@ export function placePromoted<TCustom = Record<string, unknown>>(
  * nothing. Refs with no stored object are SKIPPED, not returned as holes: an object may
  * legitimately not exist yet (the tenant posted before storing it), and a hole in the
  * array would push that decision onto every caller.
+ *
+ * Because of that, NEVER index the result by position. Order follows `refs`, but a
+ * skipped ref shifts everything after it: with `refs: ['session:1', 'match:1']` and no
+ * stored `session:1`, `const [session] = resolveRefs(...)` is the match. Select by
+ * `type` — `resolveRefs(a, objects).find((o) => o.type === 'session')` — or index the
+ * sidecar directly, since it is keyed `type:id`.
  */
 export function resolveRefs<TCustom = Record<string, unknown>>(
   activity: Activity<TCustom>,
@@ -798,14 +804,6 @@ export function useFeed<TCustom = Record<string, unknown>>(
     await fetchNext()
   }, [fetchNext, error])
 
-  /** Clear the error and re-issue the failed page. The explicit escape from the error
-   *  guard above — wire it to a "Try again" button, never to the sentinel. */
-  const retry = useCallback(async () => {
-    if (loadingMoreRef.current) return
-    setError(null)
-    await fetchNext()
-  }, [fetchNext])
-
   const addActivity = useCallback(
     async (a: {
       verb: string; object: string; target?: string | null; foreign_id?: string | null; time?: string; custom?: TCustom
@@ -968,6 +966,30 @@ export function useFeed<TCustom = Record<string, unknown>>(
       if (!signal?.aborted) setLoadingInitial(false)
     }
   }, [client, cache, feedKey, group, id, pageSize])
+
+  /**
+   * Clear the error and re-issue whatever failed. The explicit escape from `loadNext`'s
+   * error guard — wire it to a "Try again" button, never to the sentinel.
+   *
+   * Which read it re-issues depends on what broke. A failed page 2+ has a cursor to ask
+   * for again, so it re-fetches that. A failed FIRST page never set one — `next` is still
+   * null — so a cursored refetch has nothing to send and would silently no-op, leaving
+   * the error terminal and a remount the only way out. That case delegates to `refresh()`,
+   * which re-reads page 1 uncursored. Defined after `refresh` for that reason.
+   *
+   * `next === null` also means end-of-feed, where retry is meaningless: the `hadError`
+   * check keeps that a no-op rather than turning an exhausted feed into a silent refetch.
+   */
+  const retry = useCallback(async () => {
+    if (loadingMoreRef.current) return
+    const hadError = error !== null
+    setError(null)
+    if (next === null) {
+      if (hadError) await refresh()
+      return
+    }
+    await fetchNext()
+  }, [fetchNext, refresh, next, error])
 
   // Polls page 1 and BUFFERS anything newer than what's shown — never auto-prepends,
   // so an open feed never jumps under the reader (the "N new posts ↑" pattern; the app
@@ -1311,24 +1333,63 @@ export function useReactions(
   const [counts, setCounts] = useState(initialCounts)
   const [ownReactions, setOwn] = useState(initialOwn)
 
+  // A `useState` initializer runs once, so seeding from `activity.reaction_counts` would
+  // otherwise freeze this counter at mount: `live` mode revalidates the page, someone
+  // else's like arrives on the prop, and the number on screen never moves. Adopt a
+  // CHANGED seed instead — but only while no optimistic write of our own is in flight,
+  // because a poll's payload was built before the click and adopting it mid-write would
+  // visibly un-like the button and then re-like it on settle.
+  const inFlightRef = useRef(0)
+  const seedKey = JSON.stringify([initialCounts, initialOwn])
+  const lastSeedRef = useRef(seedKey)
+  // A seed we declined to adopt because a write was in flight. Kept because a FAILED
+  // write must not roll back past it: the pre-click snapshot predates whatever that seed
+  // reported (someone else's like), and since this effect only fires on a seed CHANGE,
+  // the next poll carrying that same seed would never re-offer it. Rolling back to the
+  // skipped seed instead loses only our own failed write, which is the point.
+  const skippedSeedRef = useRef<{ counts: Record<string, number>; own: string[] } | null>(null)
+  useEffect(() => {
+    if (seedKey === lastSeedRef.current) return
+    lastSeedRef.current = seedKey
+    if (inFlightRef.current > 0) {
+      skippedSeedRef.current = { counts: initialCounts, own: initialOwn }
+      return
+    }
+    skippedSeedRef.current = null
+    setCounts(initialCounts)
+    setOwn(initialOwn)
+    // initialCounts/initialOwn are deliberately NOT in the deps: they are fresh literals
+    // on every render, so listing them would re-run this every render. seedKey is their
+    // value, which is the thing that should trigger it. Do not "fix" with exhaustive-deps.
+  }, [seedKey])
+
   const react = useCallback(async (kind: string, opts?: { onError?: OptimisticOnError }) => {
     if (client === null) return // disabled — no optimistic write, no network
     const prevCounts = counts
     const prevOwn = ownReactions
     // Optimistic.
+    inFlightRef.current += 1
     setCounts((c) => ({ ...c, [kind]: (c[kind] ?? 0) + 1 }))
     setOwn((o) => (o.includes(kind) ? o : [...o, kind]))
     try {
       await client.reactions.add(kind, activityId)
     } catch (err) {
-      setCounts(prevCounts)
-      setOwn(prevOwn)
+      const skipped = skippedSeedRef.current
+      setCounts(skipped?.counts ?? prevCounts)
+      setOwn(skipped?.own ?? prevOwn)
       const handler = resolveOnError(opts, ctx.onError)
       if (handler) {
         handler(err as Error, { hook: 'useReactions', action: 'react', activityId, kind })
         return
       }
       throw err
+    } finally {
+      // finally, not after the await: the catch above returns early when an onError
+      // handler is registered, and rethrows when it isn't. Both must still release.
+      inFlightRef.current -= 1
+      // Runs after the catch, so a rollback has already consumed it. Once nothing is in
+      // flight the stash is spent: a success is followed by a fresh server seed anyway.
+      if (inFlightRef.current === 0) skippedSeedRef.current = null
     }
   }, [client, activityId, counts, ownReactions, ctx])
 
@@ -1337,19 +1398,24 @@ export function useReactions(
     const prevCounts = counts
     const prevOwn = ownReactions
     // Math.max(...,0): the server floors at 0 too — the UI must not disagree.
+    inFlightRef.current += 1
     setCounts((c) => ({ ...c, [kind]: Math.max((c[kind] ?? 0) - 1, 0) }))
     setOwn((o) => o.filter((k) => k !== kind))
     try {
       await client.reactions.unreact(activityId, kind)
     } catch (err) {
-      setCounts(prevCounts)
-      setOwn(prevOwn)
+      const skipped = skippedSeedRef.current
+      setCounts(skipped?.counts ?? prevCounts)
+      setOwn(skipped?.own ?? prevOwn)
       const handler = resolveOnError(opts, ctx.onError)
       if (handler) {
         handler(err as Error, { hook: 'useReactions', action: 'unreact', activityId, kind })
         return
       }
       throw err
+    } finally {
+      inFlightRef.current -= 1
+      if (inFlightRef.current === 0) skippedSeedRef.current = null
     }
   }, [client, activityId, counts, ownReactions, ctx])
 

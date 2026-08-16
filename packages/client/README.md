@@ -124,6 +124,12 @@ never on `message`. `retryAfterSeconds` is set on a `RATE_LIMITED` (429) and `fi
 carries per-field detail on a `VALIDATION_FAILED`. Full table:
 [Errors](https://docs.getnodex.cloud/concepts/errors/).
 
+**Upgrading from 0.8.x?** Nothing here breaks: this SDK has always thrown
+`DropInApiError`, and `message` has always been the API's own text. 0.9.0 only added
+`retryAfterSeconds`, `fields` and `url`, plus an `instanceof` that holds across a dual
+ESM/CJS load. (The bare-`Error` and stringified-body behaviour was
+`@dropinnodex/server` before 0.11.0 — if you also use that one, read its README first.)
+
 ### Follow counts
 
 ```ts

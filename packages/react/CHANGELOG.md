@@ -1,5 +1,26 @@
 # @dropinnodex/react
 
+## 0.13.0
+
+### Minor Changes
+
+- ed6b175: Two hooks that looked like they worked and didn't, both found by a real integration.
+
+  - `retry()` now recovers a failed **first** page. It re-issues the failed cursor when there
+    is one and re-reads page 1 when there isn't. Previously it delegated to the cursored
+    fetch unconditionally, which no-ops when `next` is null — exactly the state after an
+    initial load fails — so the documented escape from the error state silently did nothing
+    and a remount was the only way back. End-of-feed stays a no-op: the fallback only fires
+    when there was an error to clear.
+  - `useReactions` now adopts a **changed** seed. Counts were seeded through a `useState`
+    initializer, which reads its argument once, so a button seeded from
+    `activity.reaction_counts` froze at mount: `live` mode revalidated the page, someone
+    else's like arrived on the prop, and the number on screen never moved. A fresher seed is
+    skipped only while one of your own optimistic writes is in flight, since that payload was
+    built before the click and adopting it would visibly undo it. If that write then fails,
+    the rollback lands on the skipped seed rather than on the pre-click snapshot, so another
+    user's reaction is not discarded along with yours.
+
 ## 0.12.1
 
 ### Patch Changes

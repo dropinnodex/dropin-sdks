@@ -453,6 +453,38 @@ describe('useFeed infinite scroll', () => {
     expect(result.current.activities.map((a) => a.id)).toEqual(['a1', 'a2'])
   })
 
+  it('retry() recovers a FAILED FIRST PAGE, where there is no cursor to re-issue', async () => {
+    // The initial load never sets `next`, so a cursored refetch has nothing to ask for.
+    // retry() has to fall back to re-reading page 1 or the error state is terminal and
+    // the only way out is a remount.
+    const get = vi.fn()
+      .mockRejectedValueOnce(new Error('first page boom'))
+      .mockResolvedValueOnce({ results: [activity('a1')], next: 'cur1' })
+    const client = makeClient({ feed: vi.fn(() => ({ get })) })
+    const { result } = renderHook(() => useFeed('timeline', 'alice'), { wrapper: wrapper(client) })
+    await waitFor(() => expect(result.current.error).not.toBeNull())
+    expect(result.current.activities).toEqual([])
+
+    await act(async () => { await result.current.retry() })
+    expect(get).toHaveBeenCalledTimes(2)
+    expect(result.current.error).toBeNull()
+    expect(result.current.activities.map((a) => a.id)).toEqual(['a1'])
+    expect(result.current.hasNext).toBe(true) // the recovered page's cursor is live
+  })
+
+  it('retry() on a failed first page re-reads page 1 UNCURSORED', async () => {
+    const get = vi.fn().mockRejectedValueOnce(new Error('boom'))
+      .mockResolvedValueOnce({ results: [], next: null })
+    const client = makeClient({ feed: vi.fn(() => ({ get })) })
+    const { result } = renderHook(() => useFeed('timeline', 'alice'), { wrapper: wrapper(client) })
+    await waitFor(() => expect(result.current.error).not.toBeNull())
+
+    await act(async () => { await result.current.retry() })
+    expect(get).toHaveBeenCalledTimes(2) // without this, the assertion below reads undefined
+    // No `next` in the options — asking for a cursor we never received would 400.
+    expect(get.mock.calls[1]?.[0]).not.toHaveProperty('next')
+  })
+
   it('pageSize replaces the hardcoded limit of 20 on both the first page and loadNext', async () => {
     const get = vi.fn()
       .mockResolvedValueOnce({ results: [activity('a1')], next: 'cur1' })
@@ -597,6 +629,69 @@ describe('useReactions', () => {
     expect(result.current.ownReactions).toContain('like')
     await act(async () => { resolve() })
     expect(result.current.counts.like).toBe(1)
+  })
+
+  it('picks up fresher counts when the seed changes (live mode revalidated the activity)', async () => {
+    // useState only reads its initializer once, so a hook seeded from
+    // activity.reaction_counts would otherwise freeze at mount forever — someone else's
+    // like lands on the prop and never reaches the screen.
+    const client = makeClient()
+    const { result, rerender } = renderHook(
+      ({ counts }: { counts: Record<string, number> }) => useReactions('a1', counts, []),
+      { wrapper: wrapper(client), initialProps: { counts: { like: 4 } } },
+    )
+    expect(result.current.counts.like).toBe(4)
+
+    rerender({ counts: { like: 9 } }) // revalidation swapped in an edited activity
+    expect(result.current.counts.like).toBe(9)
+  })
+
+  it('a fresher seed does NOT stomp the viewer\'s own optimistic reaction', async () => {
+    // The race that makes naive re-syncing worse than freezing: the poll's payload was
+    // built before this click, so adopting it would visibly un-like the button.
+    let resolve: () => void = () => {}
+    const add = vi.fn(() => new Promise((r) => { resolve = () => r({}) }))
+    const client = makeClient({ reactions: { add, delete: vi.fn() } })
+    const { result, rerender } = renderHook(
+      ({ counts }: { counts: Record<string, number> }) => useReactions('a1', counts, []),
+      { wrapper: wrapper(client), initialProps: { counts: { like: 4 } } },
+    )
+
+    act(() => { void result.current.react('like') }) // optimistic: 5, own=['like']
+    expect(result.current.counts.like).toBe(5)
+
+    // A CHANGED seed — someone else liked it — that predates our click. It must be
+    // skipped, not adopted. `counts` alone can't prove that (both paths read 5 here),
+    // so assert on ownReactions: adopting would set it to the seed's [] and visibly
+    // un-like the button under the reader's finger.
+    rerender({ counts: { like: 5 } })
+    expect(result.current.ownReactions).toContain('like')
+    expect(result.current.counts.like).toBe(5)
+
+    await act(async () => { resolve() })
+    expect(result.current.ownReactions).toContain('like')
+    expect(result.current.counts.like).toBe(5)
+  })
+
+  it('a seed skipped mid-write is adopted on rollback, not discarded', async () => {
+    // The failure case the skip opens up: we ignored someone else's like because our own
+    // write was in flight, then our write failed. Rolling back to the pre-click snapshot
+    // would drop their like too — and the next poll carries that same seed, so the effect
+    // (keyed on seed changes) never fires again and the button under-counts for good.
+    let reject: () => void = () => {}
+    const add = vi.fn(() => new Promise((_r, rj) => { reject = () => rj(new Error('nope')) }))
+    const client = makeClient({ reactions: { add, delete: vi.fn() } })
+    const { result, rerender } = renderHook(
+      ({ counts }: { counts: Record<string, number> }) => useReactions('a1', counts, []),
+      { wrapper: wrapper(client), initialProps: { counts: { like: 4 } } },
+    )
+
+    act(() => { void result.current.react('like', { onError: () => {} }) })
+    rerender({ counts: { like: 5 } })       // their like, skipped while we're in flight
+    await act(async () => { reject() })
+
+    expect(result.current.counts.like).toBe(5) // theirs survives; ours is gone
+    expect(result.current.ownReactions).not.toContain('like')
   })
 
   it('starts a brand-new reaction kind from zero', async () => {

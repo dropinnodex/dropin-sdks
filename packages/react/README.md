@@ -378,12 +378,19 @@ function Timeline({ uid }: { uid: string }) {
   return activities.map((activity) => {
     // Pure, no fetching. A ref with no stored object is skipped, not an error —
     // always fall back to the activity's own custom.
-    const [session] = resolveRefs(activity, objects)
+    const session = resolveRefs(activity, objects).find((o) => o.type === 'session')
     const spotsLeft = session?.custom.spots_left ?? activity.custom.spots_left
     return <SessionCard key={activity.id} title={activity.custom.title} spotsLeft={spotsLeft} />
   })
 }
 ```
+
+**Never index the result by position.** `resolveRefs` returns objects in `refs`
+order and skips the ones that didn't resolve, so with two refs a
+`const [session] = resolveRefs(...)` hands you the *second* object whenever the
+first hasn't been stored yet — no error, no type error. Select by `type` as above,
+or index the sidecar directly: it's keyed `type:id`, so `objects['session:1234']`
+needs no helper and returns `undefined` instead of the wrong object.
 
 **`objects` is `{}`, never `undefined`.** `@dropinnodex/client`'s `feed().get()`
 types the sidecar as optional — the server omits the key when nothing on the page

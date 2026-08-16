@@ -121,6 +121,15 @@ try {
 `RATE_LIMITED` and `INTERNAL` are the retryable codes; everything else will fail
 identically on a replay. Full table: [Errors](https://docs.getnodex.cloud/concepts/errors/).
 
+**Upgrading from 0.10.x?** Before 0.11.0 this SDK threw a bare `Error` with the response
+body stringified into `.message`, so classifying a failure meant parsing that string. Any
+`err.message` regex you wrote — `/failed: 404/`, `/RATE_LIMITED/` — now matches nothing,
+silently: no exception, just a branch that never runs again, so a self-heal stops healing
+and a retry stops retrying. Switch to `err.status` / `err.code`. A dual form
+(`err instanceof DropInApiError ? err.status === 404 : /\bfailed: 404\b/.test(err.message)`)
+lands safely before the bump — importing `DropInApiError` from `@dropinnodex/client`
+until then, since this package only started re-exporting it in 0.11.0.
+
 ## Cancellation
 
 Every method takes an optional `RequestOptions` as its **last** argument, for cancelling a
