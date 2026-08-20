@@ -26,6 +26,18 @@ type ProviderProps =
       apiKey: string
       url: string
       tokenProvider: () => Promise<string>
+      /**
+       * Who the `tokenProvider` currently mints for. Optional, and only load-bearing when
+       * the signed-in user can change while this provider stays mounted — pass it there
+       * and treat it as required.
+       *
+       * The client is memoized and caches its token until a 401, so neither a new
+       * `tokenProvider` closure nor a re-render dislodges a still-valid token minted for
+       * whoever was signed in before. Changing `userId` rebuilds the client and drops the
+       * feed cache with it, which is what stops one user rendering another's feed —
+       * `own_reactions` most visibly.
+       */
+      userId?: string
       enabled?: boolean
       onError?: OptimisticOnError
       children: React.ReactNode
@@ -53,10 +65,13 @@ type ProviderProps =
  * hook's optimistic action uses as the default error sink — see "Optimistic-write error
  * handling" in the README.
  *
- * Note: the client is memoized on apiKey/url — a `tokenProvider` that needs to change
- * identity (e.g. to mint for a different user) won't be picked up unless apiKey/url also
- * change or the provider is remounted. A tokenProvider that always mints for the current
- * session (the usual pattern) needs no change.
+ * Note: the client is memoized on apiKey/url/userId, never on `tokenProvider` — that is
+ * an inline arrow in most apps, and keying on it would rebuild the client every render.
+ * **Pass `userId` whenever the signed-in user can change without remounting this
+ * provider.** Without it the memo holds the old client, which holds a still-valid token
+ * for the previous user, and the next user reads that user's feed. A provider that is
+ * remounted on sign-in, or whose tokenProvider always mints for one session, needs
+ * nothing.
  */
 export function DropInProvider(props: ProviderProps) {
   const { children } = props
@@ -71,13 +86,30 @@ export function DropInProvider(props: ProviderProps) {
         ? props.client
         : new DropInClient({ apiKey: props.apiKey, url: props.url, tokenProvider: props.tokenProvider })
     },
-    // Rebuild only when the identity-defining inputs change (enabled, client, or apiKey+url)
-    // — not exhaustive over all props (e.g. tokenProvider) by design.
-    [enabled, 'client' in props ? props.client : props.apiKey, 'client' in props ? undefined : props.url],
+    // Rebuild only when an identity-defining input changes: enabled, the supplied client,
+    // or apiKey+url+userId. `tokenProvider` is deliberately absent — it is an inline arrow
+    // in most apps, so keying on it would rebuild every render and refetch every feed.
+    // `userId` is the stable stand-in for the identity that closure mints for.
+    [
+      enabled,
+      'client' in props ? props.client : props.apiKey,
+      'client' in props ? undefined : props.url,
+      'client' in props ? undefined : props.userId,
+    ],
   )
   // A small cache keyed by feed. Deliberately not TanStack Query — this package stays
   // dependency-free apart from React itself.
+  //
+  // Its lifetime is the client's. A cached page carries caller-scoped data (`own_reactions`,
+  // and notification reads are owner-scoped), so surviving an identity change would hand
+  // the next user the previous one's view until every feed refetched. Reset in render
+  // rather than an effect: an effect would let one paint through with the stale map.
   const cache = useRef(new Map<string, CacheEntry>())
+  const clientRef = useRef(client)
+  if (clientRef.current !== client) {
+    clientRef.current = client
+    cache.current = new Map<string, CacheEntry>()
+  }
   const value = useMemo(() => ({ client, cache: cache.current, onError }), [client, onError])
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>
 }

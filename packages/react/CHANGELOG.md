@@ -1,5 +1,27 @@
 # @dropinnodex/react
 
+## 0.14.0
+
+### Minor Changes
+
+- 978202d: `DropInProvider` accepts `userId`, and keys the client on it.
+
+  The client is memoized on apiKey/url and caches its token until a 401, so a user switch
+  inside a mounted provider kept serving a still-valid token minted for the previous user —
+  and the per-feed cache kept serving that user's pages, `own_reactions` included. Neither a
+  new `tokenProvider` closure nor a re-render dislodged either, and nothing errored.
+
+  Pass `userId` and an identity change rebuilds the client, drops the feed cache, and
+  re-seeds every mounted hook. That last part matters: wiping the cache alone still left the
+  previous user's rows in each hook's `useState` until the refetch landed a round trip later,
+  and still let a stale SSR `initialData` re-seed the emptied cache with no loading state at
+  all. `useFeed`, `useNotifications` and `useCurrentUser` now reset on identity change, and
+  `initialData` is honoured only for the identity a hook mounted under.
+  It is optional and inert for the common cases — a provider remounted on sign-in, or one
+  session for the life of the page — but it is required to be correct where a user can
+  change in place. The `client` form is unchanged: supplying a different client is itself
+  the identity change, and now resets the cache too.
+
 ## 0.13.0
 
 ### Minor Changes

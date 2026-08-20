@@ -30,6 +30,12 @@ function App() {
   )
 }
 
+// Or let the provider build the client. Pass `userId` when the signed-in user can change
+// while this stays mounted: the client is memoized and caches its token until a 401, so
+// without it the next user keeps reading through the previous user's token and cached
+// pages. Changing `userId` rebuilds the client and drops the cache with it.
+//   <DropInProvider apiKey={k} url={u} userId={user.id} tokenProvider={mint}>
+
 function Timeline() {
   const { activities, loadNext, hasNext, isLoading } = useFeed('user', 'user-123')
   const { addActivity } = useFeedActions('user', 'user-123')

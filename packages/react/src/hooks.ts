@@ -511,6 +511,37 @@ export interface UseFeedOptions<TCustom = Record<string, unknown>> {
   onPromotedClick?: (promoted: PromotedActivity<TCustom>) => void
 }
 
+/**
+ * Re-initialize a hook's local state when the provider's client identity changes — which
+ * is to say, when the signed-in user changed underneath a mounted tree (see
+ * `DropInProvider`'s `userId`).
+ *
+ * Wiping the provider cache is not enough on its own. Every hook also holds the previous
+ * user's rows in `useState`, and the refetch that a client change triggers only lands a
+ * round trip later, so the stale-while-revalidate style the README recommends would paint
+ * one user's feed — `own_reactions` included — for the next one. Reset in render, not an
+ * effect: an effect resolves after the commit, which is precisely the paint we are trying
+ * to prevent.
+ */
+function useIdentityReset(client: unknown, reset: () => void): void {
+  const seen = useRef(client)
+  if (seen.current !== client) {
+    seen.current = client
+    reset()
+  }
+}
+
+/**
+ * True while `client` is still the identity this hook mounted under. SSR `initialData` is
+ * minted for one user and does not change on a client-side switch, so honouring it after
+ * one would re-seed the freshly-wiped cache with the previous user's page — and with
+ * `seed` defined, without even a loading flag. First identity only.
+ */
+function useIsFirstIdentity(client: unknown): boolean {
+  const first = useRef(client)
+  return first.current === client
+}
+
 export function useFeed<TCustom = Record<string, unknown>>(
   group: string,
   id: string,
@@ -550,7 +581,10 @@ export function useFeed<TCustom = Record<string, unknown>>(
   const setCache = (entry: Entry) => cache.set(feedKey, entry as CacheEntry)
   // Disabled mode ignores seeds too: the contract is EMPTY data, not "whatever
   // initialData happened to carry" — inert must be predictable.
-  const seed: Entry | undefined = !enabled ? undefined : cached ?? (opts?.initialData
+  const firstIdentity = useIsFirstIdentity(client)
+  // `cached ?? initialData`, but initialData only while this is the identity we mounted
+  // under — after a user switch it is the previous user's server-rendered page.
+  const seed: Entry | undefined = !enabled ? undefined : cached ?? (firstIdentity && opts?.initialData
     ? {
         activities: opts.initialData.results,
         next: opts.initialData.next,
@@ -590,6 +624,20 @@ export function useFeed<TCustom = Record<string, unknown>>(
   // identity for the poll-effect's timer) always dedupes against current data, not a
   // stale closure from whenever it was created.
   const [pending, setPending] = useState<Activity<TCustom>[]>([])
+  // The user changed under a mounted tree: drop everything the previous one was shown.
+  // `seed` is already recomputed against the wiped cache (and ignores a stale
+  // initialData), so this re-seeds to empty and puts the hook back in a loading state
+  // rather than painting the old rows while the refetch flies.
+  useIdentityReset(client, () => {
+    setActivities(seed?.activities ?? [])
+    setNext(seed?.next ?? null)
+    setPromoted(seed?.promoted ?? [])
+    setObjects(seed?.objects ?? {})
+    setPending([])
+    setError(null)
+    setLoadingInitial(enabled && seed === undefined)
+    setLoadingMore(false)
+  })
   const activitiesRef = useRef(activities)
   activitiesRef.current = activities
   // Mirrored for the same reason: `reconcileEdits` needs the current cursor to rewrite
@@ -1791,6 +1839,16 @@ export function useNotifications(opts?: {
   const [next, setNext] = useState<string | null>(null)
   const [isLoading, setLoading] = useState(client !== null)
   const [error, setError] = useState<Error | null>(null)
+  // Notifications are owner-scoped server-side, so a stale render here shows one user
+  // another's notifications AND another's unread badge.
+  useIdentityReset(client, () => {
+    setNotifications([])
+    setUnseen(0)
+    setUnread(0)
+    setNext(null)
+    setError(null)
+    setLoading(client !== null)
+  })
 
   // Lifetime of this hook's reads — aborted on unmount, so a poll or a page-2 fetch in
   // flight dies with the component. markSeen/markRead are writes and are never aborted.
@@ -1943,6 +2001,13 @@ export function useCurrentUser() {
   const [user, setUser] = useState<{ id: string; custom: Record<string, unknown> } | null>(null)
   const [isLoading, setLoading] = useState(client !== null)
   const [error, setError] = useState<Error | null>(null)
+  // This hook IS the caller's identity — showing the previous user for a round trip is
+  // the most confusing possible staleness.
+  useIdentityReset(client, () => {
+    setUser(null)
+    setError(null)
+    setLoading(client !== null)
+  })
 
   const load = useCallback(async (signal?: AbortSignal) => {
     if (client === null) return // disabled provider — inert, zero network
