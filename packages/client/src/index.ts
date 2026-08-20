@@ -319,13 +319,40 @@ export class DropInClient {
 
   constructor(private readonly opts: DropInClientOptions) {}
 
-  private getToken(forceRefresh = false): Promise<string> {
-    if (forceRefresh || this.token === null) {
-      this.token = Promise.resolve(this.opts.tokenProvider())
-      // A rejected fetch must not poison the cache forever.
-      this.token.catch(() => { this.token = null })
-    }
+  private getToken(): Promise<string> {
+    if (this.token === null) this.token = this.mint()
     return this.token
+  }
+
+  /**
+   * Replace `stale` with exactly one fresh mint, however many callers ask at once.
+   *
+   * Every request that is in flight when a token expires gets its own 401, and each one
+   * lands here. Minting per caller would mean a page holding a feed, notifications,
+   * follow stats and a reaction list hits the tenant's token endpoint four times — a
+   * session lookup and an HS256 signature each, on their infrastructure, once an hour per
+   * active tab. The identity check is what makes it single-flight: whoever arrives first
+   * swaps the promise, and everyone still holding the old one is handed that same refresh
+   * instead of starting another.
+   *
+   * Keyed on the stale promise rather than a boolean flag so a genuinely later refresh —
+   * a second expiry, or a revocation after this one — is not mistaken for a duplicate of
+   * this one and swallowed.
+   */
+  private refreshToken(stale: Promise<string> | null): Promise<string> {
+    if (this.token !== stale) return this.getToken() // someone already refreshed past us
+    this.token = this.mint()
+    return this.token
+  }
+
+  private mint(): Promise<string> {
+    const minted = Promise.resolve(this.opts.tokenProvider())
+    // A rejected mint must not poison the cache forever. The identity check is
+    // belt-and-braces rather than a fix for anything reachable today — a rejecting mint
+    // makes `await stale` throw, so no caller gets far enough to install a replacement —
+    // but it keeps the invariant local: this handler only ever clears its own promise.
+    minted.catch(() => { if (this.token === minted) this.token = null })
+    return minted
   }
 
   /**
@@ -338,11 +365,15 @@ export class DropInClient {
     // Bail before tokenProvider(), not just before fetch: the provider is usually a network
     // call to your own backend, and an already-cancelled caller must not trigger it.
     if (signal?.aborted) throw abortReason(signal)
-    let res = await this.attempt(method, path, body, false, signal)
+    // Captured, not re-read: on a 401 this is the exact promise that has to be replaced,
+    // and it is what tells refreshToken whether someone beat us to it.
+    const stale = this.getToken()
+    let res = await this.attempt(method, path, body, await stale, signal)
     if (res.status === 401) {
       // An abort between the two attempts is caught by fetch itself — a fetch with an
       // aborted signal rejects rather than replaying.
-      res = await this.attempt(method, path, body, true, signal) // fresh token, final attempt
+      const fresh = await this.refreshToken(stale)
+      res = await this.attempt(method, path, body, fresh, signal) // final attempt
     }
     if (!res.ok) throw await this.toError(res)
     // Any empty success body → undefined, not just 204: a follow/unfollow returns 201/204
@@ -352,9 +383,8 @@ export class DropInClient {
   }
 
   private async attempt(
-    method: string, path: string, body: unknown, forceRefresh: boolean, signal?: AbortSignal,
+    method: string, path: string, body: unknown, token: string, signal?: AbortSignal,
   ): Promise<Response> {
-    const token = await this.getToken(forceRefresh)
     return fetch(`${this.opts.url ?? DEFAULT_API_URL}${path}`, {
       method,
       headers: {

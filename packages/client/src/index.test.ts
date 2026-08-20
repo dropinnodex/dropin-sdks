@@ -75,6 +75,52 @@ describe('tokenProvider', () => {
     expect(callAt(1)[1].headers.authorization).toBe('Bearer fresh')
   })
 
+  it('mints ONCE when several in-flight requests hit 401 together', async () => {
+    // The shape a real page produces: a feed, notifications, follow stats and a reaction
+    // list all in flight when the token expires. Each 401 used to start its own mint, so
+    // N parallel reads meant N calls to the tenant's token endpoint — a session lookup
+    // plus an HS256 sign each, on their infrastructure, roughly hourly per active tab.
+    let minted = 0
+    const provider = vi.fn(async () => `tok-${++minted}`)
+    fetchMock.mockImplementation(async (_u: string, init: { headers: Record<string, string> }) =>
+      init.headers.authorization === 'Bearer tok-1'
+        ? jsonResponse(401, { error: { code: 'UNAUTHENTICATED', message: 'Unauthenticated', requestId: 'r1' } })
+        : jsonResponse(200, { results: [], next: null }))
+
+    const c = client(provider)
+    await Promise.all([
+      c.feed('timeline', 'alice').get(),
+      c.feed('user', 'alice').get(),
+      c.feed('flat', 'explore').get(),
+      c.notifications.get(),
+    ])
+
+    expect(provider).toHaveBeenCalledTimes(2) // one initial, one shared refresh
+    expect(fetchMock).toHaveBeenCalledTimes(8) // 4 × (401 + replay)
+    for (const call of fetchMock.mock.calls.slice(4)) {
+      expect((call[1] as Call).headers.authorization).toBe('Bearer tok-2')
+    }
+  })
+
+  it('a failed mint clears the cache, so the next request recovers', async () => {
+    // A rejected mint must not be cached: the token endpoint being down for one second
+    // cannot mean every later request fails against a poisoned promise.
+    const provider = vi.fn()
+      .mockResolvedValueOnce('tok-1')
+      .mockRejectedValueOnce(new Error('token endpoint down'))
+      .mockResolvedValueOnce('tok-3')
+    fetchMock.mockImplementation(async (_u: string, init: { headers: Record<string, string> }) =>
+      init.headers.authorization === 'Bearer tok-1'
+        ? jsonResponse(401, { error: { code: 'UNAUTHENTICATED', message: 'Unauthenticated', requestId: 'r1' } })
+        : jsonResponse(200, { results: [], next: null }))
+
+    const c = client(provider)
+    await expect(c.feed('timeline', 'alice').get()).rejects.toThrow('token endpoint down')
+    // Recovery: the poisoned cache was cleared, so the next call mints fresh and succeeds.
+    await expect(c.feed('timeline', 'alice').get()).resolves.toMatchObject({ results: [] })
+    expect(provider).toHaveBeenCalledTimes(3)
+  })
+
   it('THROWS on a second 401 — never retries unbounded', async () => {
     const provider = vi.fn(async () => 'always-bad')
     fetchMock.mockResolvedValue(jsonResponse(401, { error: { code: 'UNAUTHENTICATED', message: 'Unauthenticated', requestId: 'r1' } }))

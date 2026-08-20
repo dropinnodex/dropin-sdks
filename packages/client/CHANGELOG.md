@@ -1,5 +1,25 @@
 # @dropinnodex/client
 
+## 0.9.1
+
+### Patch Changes
+
+- 280430d: One token mint per expiry, not one per in-flight request.
+
+  Every request that was in flight when a token expired got its own 401, and each one
+  started its own `tokenProvider()` call — so a page holding a feed, notifications, follow
+  stats and a reaction list hit the tenant's token endpoint four times on expiry, roughly
+  hourly per active tab. That endpoint is the expensive side of the exchange: a session
+  lookup plus an HS256 signature, on their infrastructure.
+
+  The refresh is now single-flight, keyed on the stale promise rather than a flag so a
+  genuinely later refresh — a second expiry, or a revocation after this one — is not
+  mistaken for a duplicate and swallowed. No API change; every request behaved correctly
+  before, there were just N mints where one would do.
+
+  Found by a tenant probing re-mint with `revokeUserTokens` instead of waiting out an hour
+  of expiry: 4 requests, 4 mints, visible in their logs.
+
 ## 0.9.0
 
 ### Minor Changes
