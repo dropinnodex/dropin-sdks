@@ -269,6 +269,17 @@ export interface DropInClientOptions {
   url?: string | undefined
   /** Called on init and again on a 401 — the same contract GetStream's SDK uses. */
   tokenProvider: () => Promise<string>
+  /**
+   * Transport, defaulting to the global `fetch`. Every request this client makes goes
+   * through it, the 401 replay included.
+   *
+   * The point is testing without a network: `@dropinnodex/testing` hands over an
+   * in-memory dropin as a `fetch`, and the REAL client runs above it — token caching, the
+   * single-flight refresh, the retry-once rule, error parsing, cursor encoding. A fake
+   * that implemented this class's interface instead would bypass exactly the code most
+   * worth exercising. Also useful for a custom agent, a proxy, or instrumentation.
+   */
+  fetch?: typeof fetch | undefined
 }
 
 /**
@@ -385,7 +396,10 @@ export class DropInClient {
   private async attempt(
     method: string, path: string, body: unknown, token: string, signal?: AbortSignal,
   ): Promise<Response> {
-    return fetch(`${this.opts.url ?? DEFAULT_API_URL}${path}`, {
+    // Read per call, never captured at construction: a caller may swap the transport on
+    // an existing client, and binding it once would silently keep the old one.
+    const send = this.opts.fetch ?? fetch
+    return send(`${this.opts.url ?? DEFAULT_API_URL}${path}`, {
       method,
       headers: {
         authorization: `Bearer ${token}`,

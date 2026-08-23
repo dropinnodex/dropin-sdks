@@ -24,6 +24,47 @@ function client(tokenProvider: () => Promise<string>) {
   return new DropInClient({ apiKey: 'dk_test', url: 'http://api.test', tokenProvider })
 }
 
+describe('fetch injection', () => {
+  it('uses a supplied fetch instead of the global, for every request', async () => {
+    // The seam @dropinnodex/testing is built on: an in-memory dropin hands over a
+    // fetch-compatible function, and the REAL client runs above it — token caching, the
+    // 401 retry, error parsing, cursor encoding and all. A fake that implements the
+    // client interface instead would bypass exactly the code our bugs live in.
+    const injected = vi.fn(async () => jsonResponse(200, { results: [], next: null }))
+    const c = new DropInClient({
+      apiKey: 'dk_test', url: 'http://api.test',
+      tokenProvider: async () => 'tok', fetch: injected as unknown as typeof fetch,
+    })
+
+    await c.feed('timeline', 'alice').get()
+    expect(injected).toHaveBeenCalledTimes(1)
+    expect(fetchMock).not.toHaveBeenCalled() // the global is untouched
+  })
+
+  it('carries the injected fetch through the 401 retry', async () => {
+    // The retry path re-enters attempt(); if it reached for the global there, every
+    // token-expiry test against the fake would silently hit the network.
+    const injected = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(401, { error: { code: 'UNAUTHENTICATED', message: 'Unauthenticated', requestId: 'r1' } }))
+      .mockResolvedValueOnce(jsonResponse(200, { results: [], next: null }))
+    const c = new DropInClient({
+      apiKey: 'dk_test', url: 'http://api.test',
+      tokenProvider: vi.fn().mockResolvedValueOnce('stale').mockResolvedValueOnce('fresh'),
+      fetch: injected as unknown as typeof fetch,
+    })
+
+    await c.feed('timeline', 'alice').get()
+    expect(injected).toHaveBeenCalledTimes(2)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('falls back to the global fetch when none is supplied', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, { results: [], next: null }))
+    await client(async () => 'tok').feed('timeline', 'alice').get()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+})
+
 describe('tokenProvider', () => {
   it('calls the provider and sends the token', async () => {
     const provider = vi.fn(async () => 'tok-1')
