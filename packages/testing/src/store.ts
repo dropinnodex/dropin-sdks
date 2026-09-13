@@ -132,6 +132,22 @@ export class Store {
     return true
   }
 
+  /**
+   * Remove by foreign_id within one feed (spec 2026-09-13-remove-by-foreign-id-design.md §3.3).
+   * `time` is compared as an INSTANT — `…:00Z` and `…:00.000Z` are the same post, as they are to
+   * Postgres. Returns the ids it removed; empty when nothing live matched.
+   */
+  removeByForeignId(originFeed: string, foreignId: string, time?: string): string[] {
+    const at = time === undefined ? undefined : Date.parse(time)
+    const matches = this.activities.filter((a) =>
+      a.deleted_at === null
+      && a.origin_feed === originFeed
+      && a.foreign_id === foreignId
+      && (at === undefined || Date.parse(a.time) === at))
+    for (const a of matches) this.removeActivity(a.id)
+    return matches.map((a) => a.id)
+  }
+
   follow(source: string, target: string): boolean {
     const set = this.follows.get(source) ?? new Set<string>()
     if (set.has(target)) return false // re-follow of a live edge is a no-op

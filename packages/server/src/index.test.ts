@@ -873,3 +873,34 @@ describe('dot-segment path guard', () => {
     expect(new URL(lastCall(fn4)[0]).pathname).toBe('/v1/objects/release/v1.2')
   })
 })
+
+describe('feed().removeActivity by foreign_id', () => {
+  it('DELETEs the feed-scoped activities route with foreign_id and time in the query', async () => {
+    const fn = mockFetchOnce({ status: 200, json: { removed: ['ACT-1'] } })
+    const out = await dropin.feed('user', 'bob')
+      .removeActivity({ foreign_id: 'attend:s1:bob:1757757600000', time: '2026-09-13T10:00:00.000Z' })
+
+    expect(out).toEqual({ removed: ['ACT-1'] })
+    const [url, opts] = lastCall(fn)
+    expect(opts.method).toBe('DELETE')
+    const u = new URL(url)
+    expect(u.pathname).toBe('/v1/feeds/user/bob/activities')
+    expect(u.searchParams.get('foreign_id')).toBe('attend:s1:bob:1757757600000')
+    expect(u.searchParams.get('time')).toBe('2026-09-13T10:00:00.000Z')
+  })
+
+  it('omits time when the ref has none', async () => {
+    const fn = mockFetchOnce({ status: 200, json: { removed: [] } })
+    await dropin.feed('user', 'bob').removeActivity({ foreign_id: 'fid' })
+    const u = new URL(lastCall(fn)[0])
+    // The pathname assertion is what makes this case bite: the id-route URL also lacks `time`.
+    expect(u.pathname).toBe('/v1/feeds/user/bob/activities')
+    expect(u.searchParams.has('time')).toBe(false)
+  })
+
+  it('rejects a dot-segment feed id instead of retargeting the request', async () => {
+    const fn = mockFetchOnce({ status: 200, json: { removed: [] } })
+    await expect(dropin.feed('user', '..').removeActivity({ foreign_id: 'fid' })).rejects.toThrow(/invalid path segment/)
+    expect(fn).not.toHaveBeenCalled()
+  })
+})

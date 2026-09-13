@@ -13,8 +13,8 @@ import * as jose from 'jose'
 // DropInApiError covers the ESM+CJS dual-load case where they cannot.
 import { DropInApiError, apiErrorFromResponse } from '@dropinnodex/client'
 import type {
-  Activity, DropInObject, ErrorCode, FeedPage, Follow, FollowStats, Notification, NotificationPage,
-  Page, PatchBody, PromotedActivity, Reaction, RequestOptions, Suggestion,
+  Activity, DropInObject, ErrorCode, FeedPage, Follow, FollowStats, ForeignIdRef, Notification, NotificationPage,
+  Page, PatchBody, PromotedActivity, Reaction, RemovedActivities, RequestOptions, Suggestion,
 } from '@dropinnodex/client'
 
 // Re-exported so a backend can NAME what this SDK hands it — `addActivity` returns
@@ -22,8 +22,8 @@ import type {
 // @dropinnodex/client itself, which would be an undeclared dependency that only resolves
 // through hoisting.
 export type {
-  Activity, DropInObject, ErrorCode, FeedPage, Follow, FollowStats, Notification, NotificationPage,
-  Page, PatchBody, PromotedActivity, Reaction, RequestOptions, Suggestion,
+  Activity, DropInObject, ErrorCode, FeedPage, Follow, FollowStats, ForeignIdRef, Notification, NotificationPage,
+  Page, PatchBody, PromotedActivity, Reaction, RemovedActivities, RequestOptions, Suggestion,
 }
 export { DropInApiError }
 
@@ -170,6 +170,26 @@ const objectPath = (type: string, id: string): string =>
   `/v1/objects/${pathSegment(type)}/${pathSegment(id)}`
 
 type FetchFn = typeof fetch
+
+/**
+ * Call-signature type for `feed().removeActivity`, kept as a named local type (rather
+ * than overload signatures on a function declaration) so the two forms keep their JSDoc
+ * in the emitted `.d.ts` — tsup's dts step strips comments from inner-function overload
+ * declarations, but preserves them here.
+ */
+export type RemoveActivity = {
+  /** Soft-deletes one activity by dropin's id. A server token may remove it from
+   *  ANY feed — the origin-feed authority check applies to user tokens only —
+   *  which is what makes this usable for moderation and for cleaning up content
+   *  deleted in your own app. */
+  (activityId: string, opts?: RequestOptions): Promise<void>
+  /** Removes every live activity that lives in THIS feed with this `foreign_id` —
+   *  with `time`, only that exact instant (pass `activity.time` from the add
+   *  response). Resolves `{ removed: [] }` when nothing matched, so a retry or a
+   *  redelivered event is safe. The `(foreign_id, time)` identity stays burned:
+   *  re-posting it is a 409 CONFLICT. */
+  (ref: ForeignIdRef, opts?: RequestOptions): Promise<RemovedActivities>
+}
 
 export class DropInServer {
   private readonly key: Uint8Array
@@ -486,6 +506,21 @@ export class DropInServer {
     // each `async` method below, means the throw happens inside an async function body
     // and is converted into a rejection like every other one.
     const path = () => `/v1/feeds/${pathSegment(group)}/${pathSegment(id)}`
+    const removeById = (activityId: string, opts: RequestOptions) =>
+      this.call<void>('DELETE', `/v1/activities/${pathSegment(activityId)}`, undefined, opts)
+    const removeByForeignId = (ref: ForeignIdRef, opts: RequestOptions) =>
+      this.call<RemovedActivities>(
+        'DELETE', `${path()}/activities${qs({ foreign_id: ref.foreign_id, time: ref.time })}`, undefined, opts,
+      )
+    // Soft-delete activities — by dropin's id, or by your own `foreign_id`. Still async
+    // under the hood, so a pathSegment() throw surfaces as a rejection; the cast is
+    // needed because a single arrow taking the union of both params can't itself
+    // satisfy the overloaded RemoveActivity call type.
+    const removeActivity = (async (
+      target: string | ForeignIdRef, opts: RequestOptions = {},
+    ): Promise<void | RemovedActivities> => {
+      return typeof target === 'string' ? removeById(target, opts) : removeByForeignId(target, opts)
+    }) as RemoveActivity
     return {
       addActivity: async <TCustom = Record<string, unknown>>(a: {
         /** Server tokens set the actor explicitly (e.g. "user:alice"); user tokens
@@ -565,11 +600,7 @@ export class DropInServer {
         this.call<{ latest: string | null; changed: number | null }>(
           'GET', `${path()}/head`, undefined, opts,
         ),
-      /** Soft-delete an activity. A server token may remove an activity from ANY feed —
-       *  the origin-feed authority check applies to user tokens only — which is what makes
-       *  this usable for moderation and for cleaning up content deleted in your own app. */
-      removeActivity: async (activityId: string, opts: RequestOptions = {}) =>
-        this.call<void>('DELETE', `/v1/activities/${pathSegment(activityId)}`, undefined, opts),
+      removeActivity,
     }
   }
 

@@ -148,3 +148,72 @@ describe('createTestDropin', () => {
     })
   })
 })
+
+describe('createTestDropin — remove by foreign_id', () => {
+  it("removes the post from followers' timelines before the call resolves", async () => {
+    const dropin = createTestDropin()
+    const maya = connect(dropin, 'maya')
+    const diego = connect(dropin, 'diego')
+    await maya.feed('timeline', 'maya').follow('user', 'diego')
+
+    const time = new Date(Date.now() - 60_000).toISOString()
+    const posted = await diego.feed('user', 'diego').addActivity({
+      verb: 'attend', object: 'session:1', foreign_id: 'attend:1', time,
+    })
+    expect((await maya.feed('timeline', 'maya').get()).results.map((a) => a.id)).toEqual([posted.id])
+
+    await expect(diego.feed('user', 'diego').removeActivity({ foreign_id: 'attend:1', time: posted.time }))
+      .resolves.toEqual({ removed: [posted.id] })
+    expect((await maya.feed('timeline', 'maya').get()).results).toEqual([])
+  })
+
+  // Raw requests: the client cannot send a repeated key or an absent foreign_id, the API can receive them.
+  async function del(dropin: ReturnType<typeof createTestDropin>, userId: string, feed: string, query: string) {
+    const res = await dropin.fetch(`http://test.local/v1/feeds/${feed}/activities?${query}`, {
+      method: 'DELETE', headers: { authorization: `Bearer ${dropin.mintToken(userId)}` },
+    })
+    return { status: res.status, body: await res.json() as { removed?: string[]; error?: { code: string } } }
+  }
+
+  it('accepts a UTC Z time with or without fraction digits', async () => {
+    const dropin = createTestDropin()
+    for (const time of ['2026-09-13T10:00:00Z', '2026-09-13T10:00:00.000Z', '2026-09-13T10:00Z']) {
+      await expect(connect(dropin, 'maya').feed('user', 'maya').removeActivity({ foreign_id: 'x', time }))
+        .resolves.toEqual({ removed: [] })
+    }
+  })
+
+  // Exactly what the service's z.string().datetime() rejects, which is more than Date.parse does.
+  it.each([
+    ['date-only', 'time=2026-09-13'],
+    ['an offset', 'time=2026-09-13T10:00:00%2B02:00'],
+    ['a zoneless local time', 'time=2026-09-13T10:00:00'],
+    ['an impossible calendar date', 'time=2026-02-30T10:00:00Z'],
+    ['hour 24', 'time=2026-09-13T24:00:00Z'],
+    ['an empty time', 'time='],
+    ['a repeated time', 'time=2026-09-13T10:00:00Z&time=2026-09-13T10:00:00Z'],
+  ])('rejects %s with VALIDATION_FAILED', async (_, time) => {
+    const r = await del(createTestDropin(), 'maya', 'user/maya', `foreign_id=x&${time}`)
+    expect(r).toMatchObject({ status: 400, body: { error: { code: 'VALIDATION_FAILED' } } })
+  })
+
+  it.each([
+    ['missing', ''],
+    ['empty', 'foreign_id='],
+    ['repeated', 'foreign_id=a&foreign_id=b'],
+  ])('rejects a %s foreign_id with VALIDATION_FAILED', async (_, query) => {
+    const r = await del(createTestDropin(), 'maya', 'user/maya', query)
+    expect(r).toMatchObject({ status: 400, body: { error: { code: 'VALIDATION_FAILED' } } })
+  })
+
+  it('refuses a user token outside its own user feed, matching or not', async () => {
+    const dropin = createTestDropin()
+    const time = new Date(Date.now() - 60_000).toISOString()
+    await connect(dropin, 'diego').feed('user', 'diego').addActivity({ verb: 'post', object: 'w:1', foreign_id: 'f', time })
+    for (const feed of ['user/diego', 'timeline/maya']) {
+      const r = await del(dropin, 'maya', feed, 'foreign_id=f')
+      expect(r).toMatchObject({ status: 403, body: { error: { code: 'FORBIDDEN' } } })
+    }
+    expect(dropin.store.activities[0]!.deleted_at).toBeNull()
+  })
+})

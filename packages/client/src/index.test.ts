@@ -880,3 +880,41 @@ describe('dot-segment path guard', () => {
     expect(new URL(lastUrl()).pathname).toBe('/v1/objects/release/v1.2')
   })
 })
+
+describe('feed().removeActivity by foreign_id', () => {
+  it('DELETEs the feed-scoped activities route with foreign_id and time in the query', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, { removed: ['a-1'] }))
+    const out = await client(async () => 'tok').feed('user', 'alice')
+      .removeActivity({ foreign_id: 'attend:s1:alice:1757757600000', time: '2026-09-13T10:00:00.000Z' })
+
+    expect(out).toEqual({ removed: ['a-1'] })
+    const [url, init] = callAt(0)
+    expect(init.method).toBe('DELETE')
+    const u = new URL(url)
+    expect(u.pathname).toBe('/v1/feeds/user/alice/activities')
+    expect(u.searchParams.get('foreign_id')).toBe('attend:s1:alice:1757757600000')
+    expect(u.searchParams.get('time')).toBe('2026-09-13T10:00:00.000Z')
+    expect(u.search).toContain('attend%3As1%3Aalice') // `:` is encoded, never raw
+  })
+
+  it('omits time when the ref has none', async () => {
+    fetchMock.mockResolvedValue(jsonResponse(200, { removed: [] }))
+    await client(async () => 'tok').feed('user', 'alice').removeActivity({ foreign_id: 'fid' })
+    const u = new URL(callAt(0)[0])
+    expect(u.pathname).toBe('/v1/feeds/user/alice/activities')
+    expect(u.searchParams.get('foreign_id')).toBe('fid')
+    expect(u.searchParams.has('time')).toBe(false)
+  })
+
+  it('keeps the id form on the activity route, resolving nothing', async () => {
+    fetchMock.mockResolvedValue(new Response(null, { status: 204 }))
+    await expect(client(async () => 'tok').feed('user', 'alice').removeActivity('a-1')).resolves.toBeUndefined()
+    expect(lastUrl()).toBe('http://api.test/v1/activities/a-1')
+  })
+
+  it('rejects a dot-segment feed id instead of retargeting the request', async () => {
+    await expect(client(async () => 'tok').feed('user', '..').removeActivity({ foreign_id: 'fid' }))
+      .rejects.toThrow(/invalid path segment/)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+})

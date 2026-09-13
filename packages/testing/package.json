@@ -1,6 +1,6 @@
 {
   "name": "@dropinnodex/testing",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "In-memory dropin for tests — a fetch-compatible fake of the API, so the real client and hooks run unchanged with no network and no live tenant.",
   "keywords": [
     "dropin",

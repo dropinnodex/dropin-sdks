@@ -1,5 +1,22 @@
 # @dropinnodex/testing
 
+## 0.2.0
+
+### Minor Changes
+
+- a2b30ac: `feed().removeActivity` now also takes your own id: `removeActivity({ foreign_id, time? })`.
+
+  When the thing behind an activity is deleted in your app, you know its `foreign_id` — not
+  dropin's id. The new form removes every live activity that lives in that feed with that
+  `foreign_id` (and, with `time`, only that instant) and resolves `{ removed: string[] }`.
+  Nothing matching is success, `{ removed: [] }`, so a retry or a redelivered event is safe.
+  The id form is unchanged.
+
+  Types `ForeignIdRef` and `RemovedActivities` are exported from both SDKs. The testing fake
+  implements the route, and the contract suite pins it against the fake and the real service.
+
+  Requires the backend route `DELETE /v1/feeds/{group}/{id}/activities`; publish after it is live.
+
 ## 0.1.0
 
 ### Minor Changes

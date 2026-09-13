@@ -3,7 +3,7 @@
 // `pnpm typecheck` (tsc -b picks up src/**/* non-test files), same mechanism as
 // ssr-typing.type-check.ts. Not shipped (tsup entry is index.ts only; files:["dist"]).
 import type { Activity, Page } from '@dropinnodex/client'
-import { DropInServer, type DropInObject } from './index.js'
+import { DropInServer, type DropInObject, type RemovedActivities } from './index.js'
 
 async function _check(s: DropInServer) {
   const f = s.feed('user', 'alice')
@@ -93,3 +93,18 @@ async function _check(s: DropInServer) {
   await s.batch.objects([{ type: 'session', id: '1234', custom: { anything: 1 } }])
 }
 void _check
+
+// removeActivity overloads: the id form resolves nothing; the foreign_id form reports what it removed.
+async function _checkRemoveActivity(s: DropInServer) {
+  const f = s.feed('user', 'alice')
+  const byId: void = await f.removeActivity('a-1')
+  const byRef: RemovedActivities = await f.removeActivity({ foreign_id: 'fid', time: '2026-09-13T10:00:00.000Z' })
+  const ids: string[] = byRef.removed
+  // @ts-expect-error - the id form has no `removed` to read
+  void (await f.removeActivity('a-1')).removed
+  // @ts-expect-error - a ref needs foreign_id
+  await f.removeActivity({ time: '2026-09-13T10:00:00.000Z' })
+  void byId
+  void ids
+}
+void _checkRemoveActivity

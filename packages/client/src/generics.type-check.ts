@@ -2,7 +2,7 @@
 // from coverage/build output semantics by being pure types. Checked via `pnpm typecheck`
 // (tsc -b) since vitest's --typecheck does not fire for plain .test.ts files in this repo's
 // swc-transformed node project (see index.test.ts history / Task 1 report).
-import type { Activity, DropInClient, Page } from './index.js'
+import type { Activity, DropInClient, Page, RemovedActivities } from './index.js'
 
 // Activity<TCustom> narrows `custom`; the default keeps existing callers compiling.
 type CustomFit = Activity<{ title: string }>
@@ -39,3 +39,19 @@ async function _checkAddActivityRefs(c: DropInClient) {
   })
 }
 void _checkAddActivityRefs
+
+// removeActivity overloads: the id form resolves nothing; the foreign_id form reports what it removed.
+declare const removeClient: DropInClient
+async function _removeActivityForms() {
+  const feed = removeClient.feed('user', 'alice')
+  const byId: void = await feed.removeActivity('a-1')
+  const byRef: RemovedActivities = await feed.removeActivity({ foreign_id: 'fid', time: '2026-09-13T10:00:00.000Z' })
+  const ids: string[] = byRef.removed
+  // @ts-expect-error - the id form has no `removed` to read
+  void (await feed.removeActivity('a-1')).removed
+  // @ts-expect-error - a ref needs foreign_id
+  await feed.removeActivity({ time: '2026-09-13T10:00:00.000Z' })
+  void byId
+  void ids
+}
+void _removeActivityForms

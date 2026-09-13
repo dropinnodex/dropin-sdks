@@ -33,6 +33,17 @@ export interface InjectedFailure {
   retryAfterSeconds?: number
 }
 
+/**
+ * Zod 4's default `z.string().datetime()`, copied rather than approximated: UTC `Z` only,
+ * optional seconds and fraction, real calendar dates (Feb 29 on leap years only), hours 00-23.
+ * `Date.parse` is not a substitute — it accepts `2026-09-13`, offsets, and `Sep 13 2026`.
+ */
+const ISO_DATETIME = new RegExp(
+  '^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29'
+  + '|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))'
+  + 'T(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?Z$',
+)
+
 /** A caller, resolved from the token. `userId` null means a server token. */
 interface Caller { userId: string | null }
 
@@ -155,6 +166,8 @@ class Fake implements TestDropin {
     // POST /v1/feeds/:group/:id/activities
     m = /^\/v1\/feeds\/([^/]+)\/([^/]+)\/activities$/.exec(p)
     if (m !== null && method === 'POST') return this.addActivity(caller, m[1]!, m[2]!, parsed)
+    // DELETE /v1/feeds/:group/:id/activities?foreign_id=&time=
+    if (m !== null && method === 'DELETE') return this.removeByForeignId(caller, m[1]!, m[2]!, url)
 
     // POST /v1/feeds/:group/:id/follows
     m = /^\/v1\/feeds\/([^/]+)\/([^/]+)\/follows$/.exec(p)
@@ -226,6 +239,24 @@ class Fake implements TestDropin {
       next: more && last !== undefined ? this.encodeCursor(last) : null,
       ...(refs.size > 0 ? { objects } : {}),
     })
+  }
+
+  private removeByForeignId(caller: Caller, group: string, id: string, url: URL): Response {
+    // Validation first, as in the service: its Zod pipe runs before the handler's authority
+    // check. Neither reveals whether a match exists — authority still precedes any lookup.
+    const foreignIds = url.searchParams.getAll('foreign_id')
+    const times = url.searchParams.getAll('time')
+    // A repeated key arrives as an array, which the service's z.string() refuses.
+    if (foreignIds.length !== 1 || foreignIds[0] === '') {
+      return this.error('VALIDATION_FAILED', 'foreign_id is required')
+    }
+    if (times.length > 1 || (times.length === 1 && !ISO_DATETIME.test(times[0]!))) {
+      return this.error('VALIDATION_FAILED', 'time must be an ISO-8601 UTC date-time')
+    }
+    if (caller.userId !== null && (group !== 'user' || id !== caller.userId)) {
+      return this.error('FORBIDDEN', 'Forbidden')
+    }
+    return this.json({ removed: this.s.removeByForeignId(feedRef(group, id), foreignIds[0]!, times[0]) })
   }
 
   private addActivity(caller: Caller, group: string, id: string, parsed: unknown): Response {

@@ -1,6 +1,6 @@
 {
   "name": "@dropinnodex/client",
-  "version": "0.9.1",
+  "version": "0.10.0",
   "description": "Isomorphic, zero-dependency client SDK for dropin-activity — feeds, activities, reactions, and follows over fetch. Browser or Node.",
   "keywords": [
     "dropin",

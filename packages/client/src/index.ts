@@ -300,6 +300,37 @@ export interface RequestOptions {
   signal?: AbortSignal | undefined
 }
 
+/** Identifies activities by YOUR id rather than dropin's: the `foreign_id` you posted with,
+ *  and optionally the `time` — which narrows the match to that exact instant. */
+export interface ForeignIdRef {
+  foreign_id: string
+  time?: string
+}
+
+/** What `feed().removeActivity({ foreign_id })` removed. Empty when nothing matched. */
+export interface RemovedActivities {
+  removed: string[]
+}
+
+/**
+ * Call-signature type for `feed().removeActivity`, kept as a named local type (rather
+ * than overload signatures on a function declaration) so the two forms keep their JSDoc
+ * in the emitted `.d.ts` — tsup's dts step strips comments from inner-function overload
+ * declarations, but preserves them here.
+ */
+export type RemoveActivity = {
+  /** Soft-deletes one activity by dropin's id. The gateway enforces authority =
+   *  origin_feed, so a feed you don't own is a 403. */
+  (activityId: string, opts?: RequestOptions): Promise<void>
+  /** Removes every live activity in THIS feed with this `foreign_id` — with `time`,
+   *  only that exact instant (pass `activity.time` from the add response). Resolves
+   *  `{ removed: [] }` when nothing matched, so a retry or a redelivered event is
+   *  safe. The `(foreign_id, time)` identity stays burned: re-posting it is a 409
+   *  CONFLICT. The gateway enforces authority = origin_feed here too, so calling
+   *  this on a feed you don't own is a 403, not a silent no-op. */
+  (ref: ForeignIdRef, opts?: RequestOptions): Promise<RemovedActivities>
+}
+
 /** The abort reason if the caller supplied one, else the DOMException fetch would throw. */
 function abortReason(signal: AbortSignal): unknown {
   return signal.reason ?? new DOMException('The operation was aborted.', 'AbortError')
@@ -434,6 +465,22 @@ export class DropInClient {
     // each `async` method below, means the throw happens inside an async function body
     // and is converted into a rejection like every other one.
     const path = () => `/v1/feeds/${pathSegment(group)}/${pathSegment(id)}`
+    const removeById = (activityId: string, opts: RequestOptions) =>
+      this.call<void>('DELETE', `/v1/activities/${pathSegment(activityId)}`, undefined, opts)
+    const removeByForeignId = (ref: ForeignIdRef, opts: RequestOptions) =>
+      this.call<RemovedActivities>(
+        'DELETE', `${path()}/activities${this.qs({ foreign_id: ref.foreign_id, time: ref.time })}`, undefined, opts,
+      )
+    // GetStream mirror: feed.removeActivity(id) and feed.removeActivity({ foreign_id }). The id
+    // form hits the activity route; the ref form removes by foreign_id within THIS feed.
+    // Still async under the hood, so a pathSegment() throw surfaces as a rejection like
+    // every other SDK error; the cast is needed because a single arrow taking the union
+    // of both params can't itself satisfy the overloaded RemoveActivity call type.
+    const removeActivity = (async (
+      target: string | ForeignIdRef, opts: RequestOptions = {},
+    ): Promise<void | RemovedActivities> => {
+      return typeof target === 'string' ? removeById(target, opts) : removeByForeignId(target, opts)
+    }) as RemoveActivity
     return {
       get: async <TCustom = Record<string, unknown>>(
         q: { limit?: number; next?: string; /** @deprecated use `next` */ cursor?: string } = {},
@@ -461,10 +508,7 @@ export class DropInClient {
         opts: RequestOptions = {},
       ) =>
         this.call<Page<Follow>>('GET', `${path()}/follows${this.qs({ limit: q.limit, next: q.next ?? q.cursor })}`, undefined, opts),
-      // GetStream mirror: feed.removeActivity(id). Hits the activity route; the gateway
-      // enforces authority = origin_feed, so removing from a feed you don't own is a 403.
-      removeActivity: async (activityId: string, opts: RequestOptions = {}) =>
-        this.call<void>('DELETE', `/v1/activities/${pathSegment(activityId)}`, undefined, opts),
+      removeActivity,
       /**
        * Patch an activity's `custom` and/or `refs`. Permitted on your own activities
        * only. `body.refs`, when present, replaces the refs array wholesale (`[]`
