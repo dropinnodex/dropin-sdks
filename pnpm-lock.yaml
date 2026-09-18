@@ -69,12 +69,6 @@ importers:
         specifier: ^6.2.3
         version: 6.2.4
 
-  packages/testing:
-    devDependencies:
-      '@dropinnodex/client':
-        specifier: workspace:^
-        version: link:../client
-
 packages:
 
   '@asamuzakjp/css-color@5.1.11':
